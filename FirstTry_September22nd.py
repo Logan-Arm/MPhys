@@ -34,13 +34,6 @@ def numba_col_sum(array,mu_index):
         total+=array[i,mu_index]
     return total
 
-@njit(parallel = True)
-def phi_array(num_sig_meaning_array, alpha, s):
-    alpha_on_s = alpha/s
-    phi = np.empty_like((num_sig_meaning_array))
-    num_meanings = num_sig_meaning_array.shape[1]
-    for i in prange(num_meanings):
-        pass
         
 
 @njit
@@ -125,7 +118,79 @@ def blind_success_outer_loop(num_agents,ensemble_phi,num_signals,num_meanings):
 #     return ensemble_count
 #Don't think above is helpful if I cannot pass the agent list
 
+@njit
+def numba_random_choice(array,prob):
+    """Numba does not accept the probability distribution for the np.random.choice() function, as such we need a workaround to be able to handle 
+    this efficiently.  This function was taken from the numba support issue 2539, specifically from commentor Mike Fenton
+    
+    :param arr: A 1D numpy array of values to sample from.
+    :param prob: A 1D numpy array of probabilities for the given samples.
+    :return: A random sample from the given array with a given probability.
 
+    
+    """
+    return array[np.searchsorted(np.cumsum(prob), np.random.random(), side="right")]
+
+
+
+
+
+
+############################################################################################################################
+@njit
+def select_signal_njit(alpha_dist, signals,meanings, phi_array, meanings_list_forIDX):
+    """A numba function for fast meaning selection and signal emission once provided the rho (attentional weight dirichlet) distribution.
+    The attentional weight distribution is calculated using sci-py, which is not supported in numba, thus we have no way to entirely numba-fy
+    this process unless we decide to make a numba calculator of the dirichlet distribution. 
+    """
+    rho_dist = np.random.dirichlet(alpha=alpha_dist)
+    selected_mu = numba_random_choice(meanings,rho_dist)
+    mu_idx = meanings_list_forIDX.index(selected_mu)
+    signal_prob = phi_array[:,mu_idx]
+    selected_signal= numba_random_choice(signals,signal_prob)
+    return selected_signal, rho_dist
+
+
+@njit
+def select_signal_integers_njit(alpha_dist, phi_array,meanings_integers,signals_integers):
+    """A numba function for fast meaning selection and signal emission once provided the rho (attentional weight dirichlet) distribution.
+    The attentional weight distribution is calculated using sci-py, which is not supported in numba, thus we have no way to entirely numba-fy
+    this process unless we decide to make a numba calculator of the dirichlet distribution. 
+    """
+    rho_dist = np.random.dirichlet(alpha=alpha_dist)
+    selected_mu = numba_random_choice(meanings_integers,rho_dist)
+    signal_prob = phi_array[:,selected_mu]
+    selected_signal_idx= numba_random_choice(signals_integers,signal_prob)
+    return selected_signal_idx, rho_dist
+
+@njit
+def receive_signal_integers_njit(signal_idx,A,passed_rho_dist,alpha_dist,phi_array,meanings_integers,num_meanings):
+    """A numba version of the signal receiving and interpretation process"""
+    rho_roll = np.random.rand()
+    if rho_roll<=A:
+        rho_dist = passed_rho_dist
+    else:
+        rho_dist = np.random.dirichlet(alpha=alpha_dist)
+    # print("Rho dist")
+    # print(rho_dist)
+    
+    phi_s_mu = phi_array[int(signal_idx),:]
+    # print("phi_s_mu")
+    # print(phi_s_mu)
+    denom = (phi_s_mu*rho_dist).sum()
+    # print("Denominator")
+    # print(denom)
+    posterior_dist = np.zeros(num_meanings, dtype=np.float64)
+    for j in range(num_meanings):
+        inst_val = (phi_s_mu[j]*rho_dist[j])/denom
+        # print("inst_val")
+        # print(inst_val)
+        posterior_dist[j] = ((phi_s_mu[j]*rho_dist[j])/denom)
+
+    # print("Posterior Chain")
+    # print(posterior_dist)
+    nu_idx = numba_random_choice(meanings_integers,posterior_dist)
+    return nu_idx
 
 
 
@@ -149,6 +214,11 @@ class Agent:
         self.meanings_list = meanings
         self.signals_list = signals
 
+        #Need some list of integers to pass to the numba functions corresponding to the meanings and signal distributions
+        self.meanings_integers = np.arange(self.num_meanings, dtype=int)
+        print(self.meanings_integers)
+        self.signals_integers = np.arange(self.num_signals,dtype=int)
+        print(self.signals_integers)
 
         self.Alpha = alpha
         self.Alpha_s = alpha/self.num_signals
@@ -174,7 +244,7 @@ class Agent:
         self.phi_array = np.full((self.num_signals,self.num_meanings),fill_value= (1/self.num_signals))
         """At initialisation the phi array is uniformally distributed such that all signals are equally likely"""
 
-    def select_signal(self):
+    def select_signal_numpy(self):
         """A function to be used when this agent is chosen to select a signal to send"""
 
         inst_rho = sc.stats.dirichlet.rvs(alpha = self.alpha_dist, size = 1).squeeze()
@@ -198,6 +268,10 @@ class Agent:
         ###
 
         return selected_signal, inst_rho,
+
+    def select_signal_numba(self):
+        selected_signal, inst_rho = select_signal_integers_njit(self.alpha_dist,self.phi_array,self.meanings_integers,self.signals_integers)
+        return selected_signal,inst_rho
 
     def receive_signal(self, signal, rho_distribution,A):
         """In future, break this up into two functions, one where we need to re-generate rho, and one where we don't"""
@@ -237,13 +311,17 @@ class Agent:
         # print(f"Selected meaning is {nu}")
         return nu, signal_idx
 
-    def update_counts(self, interpreted_nu, signal_idx):
+    def receive_signal_numba(self,signal_idx,rho_dist,A):
+        nu_idx = receive_signal_integers_njit(signal_idx,A,rho_dist,self.alpha_dist,self.phi_array,self.meanings_integers,self.num_meanings)
+        return nu_idx
+    def update_counts(self, nu_idx, signal_idx):
         """Update rule is that all values in the signal_meaning_array decay by (1-lambda)*current_value, 
         with the exception of the actual signal, which while it does decay, is also incremented by 1. """
         # print("phi array before")
         # print(self.phi_array)
         #Now updating the posterior distribution
-        nu_idx = self.meanings_list.index(interpreted_nu)
+        # nu_idx = self.meanings_list.index(interpreted_nu)
+
         self.phi_array = update_phi(self.phi_array,self.signal_meaning_array,self.lambda_val,
                                     self.Alpha,nu_idx,signal_idx,self.num_signals)
         # print("phi array after")
@@ -291,6 +369,8 @@ class Ensemble:
 
     
     def numba_warmup(self):
+        test_array = np.array([0,1])
+
         print("Initialising Numba Functions")
         selected_agent = self.agent_list[0]
         print("Testing delta")
@@ -302,6 +382,22 @@ class Ensemble:
         print("Testing update_signal meaning")
         update_signal_meaning(selected_agent.signal_meaning_array,selected_agent.lambda_val,1,1,selected_agent.num_signals)  
 
+        print("Testing numba_random_choice")
+        numba_random_choice(test_array,test_array)
+
+        # print("Testing select_signal_njit")
+        # select_signal_njit(selected_agent.alpha_dist,selected_agent.signals,selected_agent.meanings,
+        #                    selected_agent.phi_array,selected_agent.meanings_list)
+        
+
+        print("Testing select_signal_integers_njit")
+        discard, rho_dist = select_signal_integers_njit(selected_agent.alpha_dist,selected_agent.phi_array,
+                                    selected_agent.meanings_integers,selected_agent.signals_integers)
+
+        print("Testing receive_signal_integers_njit")
+        receive_signal_integers_njit(1,1,rho_dist,test_array,selected_agent.phi_array,selected_agent.meanings_integers,
+                                     selected_agent.num_meanings)
+        
         # print("Test create_phi_tensor")
         # create_phi_tensor(1,self.agent_list,self.num_signals,self.num_meanings)
         print("Test blind success inner loop")
@@ -315,13 +411,19 @@ class Ensemble:
         selected_agents = np.random.choice(self.agent_ids,size=2, replace=False)
         signaller_agent = self.agent_list[selected_agents[0]]
         receiver_agent = self.agent_list[selected_agents[1]]
+        # print("Agents selected")
 
-        selcted_signal,inst_rho = signaller_agent.select_signal()
 
-        nu, signal_idx = receiver_agent.receive_signal(selcted_signal,inst_rho,self.A)
+        selcted_signal_idx,inst_rho = signaller_agent.select_signal_numba()
+        # print("Signal and rho sent")
+        # print(selcted_signal_idx,inst_rho)
 
-        receiver_agent.update_counts(nu,signal_idx)
+        nu_idx = receiver_agent.receive_signal_numba(selcted_signal_idx,inst_rho,self.A)
+        # print("Signal received")
+        # print(nu_idx)
 
+        receiver_agent.update_counts(nu_idx,selcted_signal_idx)
+        # print("counts updated")
 
 
     def measure_blind_success(self):
@@ -356,7 +458,7 @@ class Ensemble:
             if ((i>0) and (i%50000 ==0)):
                 print(f"On iteration {i}")
                 self.update_ensemble_arrays()
-
+                
                 p_s = self.measure_blind_success()
                 gain = ((self.num_meanings*p_s) -1)/(self.num_signals-1)
                 self.gain_values.append(gain)
@@ -381,9 +483,24 @@ if __name__ =="__main__":
     agent_func = lambda : Agent(meanings,signals, lambda_val=0.1)
 
     Test_ensemble = Ensemble(5,agent_func,1,num_signals,num_meanings)
-    Test_ensemble.training_loop(iterations=2000000)
+    Test_ensemble.training_loop(iterations=3000000)
+    # Test_ensemble.one_interaction()
     
+    #Testing numpy dirichlet dist
+    # beta = 49
+    # alpha_dist = np.full(num_meanings, (beta/num_meanings))
+    # inst_dirichlet = np.random.dirichlet(alpha_dist)
+    # print(inst_dirichlet)
 
+
+    # prob_dist_test = np.array([0.35,0.5,0.15])
+    # array_test = np.array([1,2,3])
+    # warmup = numba_random_choice(array_test,prob_dist_test)
+    # counts_array = np.zeros((3,))
+    # for i in range(100000000):
+    #     randomdraw = numba_random_choice(array_test,prob_dist_test)
+    #     counts_array[randomdraw-1]+=1
+    # print(counts_array)
 
 
     
