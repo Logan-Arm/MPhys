@@ -1,6 +1,8 @@
 import numpy as np
 import scipy as sc
 import scipy.stats
+import matplotlib.pyplot as plt
+import seaborn as sns
 import numba
 from numba import njit, prange
 
@@ -10,12 +12,16 @@ from numba import njit, prange
 #As a test, starting with 3 meanings, 2 signals
 meanings = ["dog",
             "cat",
-            "bird"]
+            "bird",
+            "pig"]
 
 
 signals = ["red",
            "blue"]
 
+
+"""Oftentimes I am passing variables like num_meanings and num_signals; even though these could be recalculated in one line, 
+I still believe it is faster to just pass the variable"""
 
 ###
 #Numba Section
@@ -77,7 +83,47 @@ def create_phi_tensor(num_agents, agent_list,num_signals,num_meanings):
             for k in prange(num_meanings):
                 phi_tensor[i,j,k] = agent_list[i].phi_array[j,k]
 
+@njit
+def blind_success_inner_loop(agenti_phi,agentj_phi,num_signals,num_meanings):
+    """I am defining the inner loop to be the sum over all meanings and signals of the selected agent's
+    phi matrices.  I have decided to break up the blind_success calculations into two parts as I believe it 
+    will allow for easier modification of the formula, as well as an easier way to think about the process
+    actually being done."""
+    inst_sum = 0.0
+    for a in range(num_meanings):
+        signal_sum = 0.0
+        for b in range(num_signals):
+            denom_term = agentj_phi[b,:].sum()
+            signal_sum+=(agenti_phi[b,a]*agentj_phi[b,a])/denom_term
+        inst_sum+=(1/num_meanings)*signal_sum
+    return inst_sum
 
+@njit
+def blind_success_outer_loop(num_agents,ensemble_phi,num_signals,num_meanings):
+    """The outer loop of the blind success metric calculation, summing over all interacting agent pairs"""
+    p_s =0.0
+    const = 1/(num_agents*(num_agents-1))
+    for i in range(num_agents):
+        for j in range(num_agents):
+            if i==j:
+                continue
+            else:
+                agenti_phi = ensemble_phi[i,:]
+                agentj_phi = ensemble_phi[j,:]
+                p_s += blind_success_inner_loop(agenti_phi,agentj_phi,num_signals,num_meanings)
+    p_s*=const
+    return p_s
+
+# @njit(parallel = True)
+# def calculate_ensemble_count_array(num_agents, ensemble_count_array):
+#     """Calculating the ensemble average n(s|m) array"""
+#     ensemble_count = np.empty_like(ensemble_count_array[0,:]) #create a blank version of the signal_meaning array to store the new ensemble average
+#     for i in prange(num_agents):
+#         ensemble_count[:] = ensemble_count_array[i,:].sum()
+#         ensemble_count[:,:] = agent_list[i].signal_meaning_array[i,:,:].sum()
+#     ensemble_count/=num_agents
+#     return ensemble_count
+#Don't think above is helpful if I cannot pass the agent list
 
 
 
@@ -128,17 +174,6 @@ class Agent:
         self.phi_array = np.full((self.num_signals,self.num_meanings),fill_value= (1/self.num_signals))
         """At initialisation the phi array is uniformally distributed such that all signals are equally likely"""
 
-    def generate_phi(self,mu_idx): #NOW OUTDATED
-        """Function to be used to generate an agents phi(s|m), or their posterior predictive distribution, from a given mu
-        Specifically used in signal generation, and measures of communication gain
-        """
-
-        ni_s_m_column = self.signal_meaning_array[:,mu_idx]
-        sum_term = ni_s_m_column.sum() #Using the .sum() is faster than using np.sum by ~2.5X, still slower than numba by ~2x, so this provides potential speedup later
-        signal_prob = (ni_s_m_column + self.Alpha_s)/(sum_term + self.Alpha)
-        print(f"Signal probability is {signal_prob}")
-        return signal_prob
-
     def select_signal(self):
         """A function to be used when this agent is chosen to select a signal to send"""
 
@@ -146,18 +181,18 @@ class Agent:
         ###
         #Double check size = 1 is wanted here
         ###
-        print(f"inst_rho is {inst_rho}")
+        # print(f"inst_rho is {inst_rho}")
         #Creates an attentional weight distribution over all the meanings
 
         selected_mu = np.random.choice(self.meanings, p=inst_rho)
-        print(f"Selected mu is {selected_mu}")
+        # print(f"Selected mu is {selected_mu}")
 
         mu_idx = self.meanings_list.index(selected_mu)
 
         signal_prob = self.phi_array[:,mu_idx]
 
         selected_signal = np.random.choice(self.signals,p=signal_prob)
-        print(f"The selected signal is {selected_signal}")
+        # print(f"The selected signal is {selected_signal}")
         ###
         #Double check this is the correct way to go about choosing the signal
         ###
@@ -183,47 +218,46 @@ class Agent:
 
 
         signal_idx = self.signals_list.index(signal)
-        print(f"Received signal idx is {signal_idx}")
+        # print(f"Received signal idx is {signal_idx}")
         phi_s_mu = self.phi_array[signal_idx,:] #Grabs vector containing the likelihood of using signal corresponding to signal idx for each meaning
         denom = (phi_s_mu * inst_rho).sum()
-        if np.abs(denom-1) >= 1e-3:
-            print("Signal denominator larger than 1") 
+        # if np.abs(denom-1) >= 1e-3:
+        #     print("Signal denominator larger than 1") 
 
         posterior_dist = np.empty((self.num_meanings,))
-        print(f"Shape of posterio dist is {posterior_dist.shape}")
+        # print(f"Shape of posterio dist is {posterior_dist.shape}")
 
         for j in range(self.num_meanings):
             posterior_dist[j] = (phi_s_mu[j] * inst_rho[j])/denom
 
-        print(f"Posterior dist is {posterior_dist}")
-        print(f"Sum of post dist is {np.sum(posterior_dist)}")
+        # print(f"Posterior dist is {posterior_dist}")
+        # print(f"Sum of post dist is {np.sum(posterior_dist)}")
         
         nu = np.random.choice(self.meanings, p=posterior_dist)
-        print(f"Selected meaning is {nu}")
+        # print(f"Selected meaning is {nu}")
         return nu, signal_idx
 
     def update_counts(self, interpreted_nu, signal_idx):
         """Update rule is that all values in the signal_meaning_array decay by (1-lambda)*current_value, 
         with the exception of the actual signal, which while it does decay, is also incremented by 1. """
-        print("phi array before")
-        print(self.phi_array)
+        # print("phi array before")
+        # print(self.phi_array)
         #Now updating the posterior distribution
         nu_idx = self.meanings_list.index(interpreted_nu)
         self.phi_array = update_phi(self.phi_array,self.signal_meaning_array,self.lambda_val,
                                     self.Alpha,nu_idx,signal_idx,self.num_signals)
-        print("phi array after")
-        print(self.phi_array)
+        # print("phi array after")
+        # print(self.phi_array)
 
         #Now updating the counts array
-        print("Counts array before")
-        print(self.signal_meaning_array)
+        # print("Counts array before")
+        # print(self.signal_meaning_array)
         self.signal_meaning_array = update_signal_meaning(self.signal_meaning_array,self.lambda_val,
                                                           nu_idx,signal_idx,self.num_signals)
-        print("Counts after")
-        print(self.signal_meaning_array)
+        # print("Counts after")
+        # print(self.signal_meaning_array)
         
         
-
 
 
 class Ensemble:
@@ -237,37 +271,101 @@ class Ensemble:
 
         self.agent_list = [agent_fn() for _ in range(num_agents)]
         #Creates the initial list of agents
+        self.ensemble_phi = np.empty((self.number_agents,self.num_signals,self.num_meanings))
+        self.ensemble_counts = np.empty_like(self.ensemble_phi)
+        self.update_ensemble_arrays()
+
+
         self.numba_warmup()
-        self.agent_index_array = np.ones((num_agents,num_agents))
-        #Store an array of num_agents by num_agents, this allows us to vectorise over num_agents for interacting pair calculations (I think)
+        self.gain_epochs = []
+        self.gain_values = []
+
+
+
+    def update_ensemble_arrays(self):
+        """Numba cannot be passed an agent_type at all, as such, we need to create tensors for the ensemble average values,
+        i.e., values we would otherwise obtain in a numba function from the objects passed."""
+        for i in range(self.number_agents):
+            self.ensemble_phi[i,:] = self.agent_list[i].phi_array
+            self.ensemble_counts[i,:] = self.agent_list[i].signal_meaning_array
+
+    
     def numba_warmup(self):
         print("Initialising Numba Functions")
         selected_agent = self.agent_list[0]
+        print("Testing delta")
         delta(1,1)
+        print("Testing update_phi")
         update_phi(selected_agent.phi_array,selected_agent.signal_meaning_array,selected_agent.lambda_val,
                    selected_agent.Alpha,1,1,selected_agent.num_signals)
-    
+
+        print("Testing update_signal meaning")
         update_signal_meaning(selected_agent.signal_meaning_array,selected_agent.lambda_val,1,1,selected_agent.num_signals)  
+
+        # print("Test create_phi_tensor")
+        # create_phi_tensor(1,self.agent_list,self.num_signals,self.num_meanings)
+        print("Test blind success inner loop")
+        blind_success_inner_loop(self.agent_list[0].phi_array,self.agent_list[1].phi_array,self.num_signals,self.num_meanings)
+        print("Test blind success outer loop")
+        blind_success_outer_loop(self.number_agents,self.ensemble_phi,self.num_signals,self.num_meanings)
+
+
 
     def one_interaction(self):
         selected_agents = np.random.choice(self.agent_ids,size=2, replace=False)
         signaller_agent = self.agent_list[selected_agents[0]]
         receiver_agent = self.agent_list[selected_agents[1]]
 
-        selcted_signal,inst_rho = self.agent_list[signaller_agent].select_signal()
+        selcted_signal,inst_rho = signaller_agent.select_signal()
 
         nu, signal_idx = receiver_agent.receive_signal(selcted_signal,inst_rho,self.A)
 
         receiver_agent.update_counts(nu,signal_idx)
 
 
-        
 
     def measure_blind_success(self):
         """Sum over all pairs and then subtract the diagonal elements"""
-        phi_tensor = create_phi_tensor(self.number_agents,self.agent_list,self.num_signals,self.num_meanings)
+        p_s = blind_success_outer_loop(self.number_agents,self.ensemble_phi,self.num_signals,self.num_meanings)
+        return p_s
+
+    def plot_ensemble_counts(self,ensemble_avg):
+        """Plots the ensemble average signal/meaning count array"""
+        lambda_val = self.agent_list[0].lambda_val
+        fig,ax = plt.subplots(figsize = (10,6))
+        sns.heatmap(ensemble_avg,cmap = 'coolwarm')
+        ax.set_xlabel("Meanings")
+        ax.set_ylabel("Signals")
+        ax.set_title(f"Counts of Signals vs Meaning for $\lambda$ = {lambda_val}")
+        plt.savefig(fr"C:/Users/Logan/Downloads/MPhys/Plots/ensemble_counts_lambda{lambda_val}.png")
+        plt.close()
+
+    def plot_communication_gain(self):
+        lambda_val = self.agent_list[0].lambda_val
+        fig,ax = plt.subplots(figsize = (10,6))
+        ax.plot(self.gain_epochs, self.gain_values)
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Communication Gain")
+        ax.set_title(f"Communication Gain vs Time for $\lambda$ = {lambda_val}")
+        plt.savefig(fr"C:/Users/Logan/Downloads/MPhys/Plots/Gain_{lambda_val}.png")
+        plt.close()
+
+    def training_loop(self,iterations):
+        for i in range(iterations):
+            self.one_interaction()
+            if ((i>0) and (i%50000 ==0)):
+                print(f"On iteration {i}")
+                self.update_ensemble_arrays()
+
+                p_s = self.measure_blind_success()
+                gain = ((self.num_meanings*p_s) -1)/(self.num_signals-1)
+                self.gain_values.append(gain)
+                self.gain_epochs.append(i)
+
+        ensemble_average_counts = np.mean(self.ensemble_counts, axis = 0)
+        self.plot_communication_gain()
+        self.plot_ensemble_counts(ensemble_avg=ensemble_average_counts)
         
-        pass
 
 
 
@@ -277,22 +375,13 @@ if __name__ =="__main__":
 
     # send_agent = Agent(meanings=meanings,signals=signals,lambda_val=0.001)
     # receive_agent = Agent(meanings=meanings,signals=signals,lambda_val=0.001)
+    num_signals = len(signals)
+    num_meanings = len(meanings)
+    #Initial compiling of numba functions  
+    agent_func = lambda : Agent(meanings,signals, lambda_val=0.1)
 
-    #Initial compiling of numba functions
-    delta(1,1)
-    update_phi(send_agent.phi_array,send_agent.signal_meaning_array,send_agent.lambda_val,
-               send_agent.Alpha,1,1,send_agent.num_signals)
-
-    update_signal_meaning(send_agent.signal_meaning_array,send_agent.lambda_val,1,1,send_agent.num_signals)
-    
-    selcted_signal, inst_rho = send_agent.select_signal()
-    print('########################################')
-    nu, signal_idx = receive_agent.receive_signal(selcted_signal,inst_rho, A=1)
-    print('########################################')
-    receive_agent.update_counts(nu,signal_idx)
-
-    # agents = [Agent(meanings=meanings,signals=signals,lambda_val=0.001) for _ in range(2)]
-
+    Test_ensemble = Ensemble(5,agent_func,1,num_signals,num_meanings)
+    Test_ensemble.training_loop(iterations=2000000)
     
 
 
