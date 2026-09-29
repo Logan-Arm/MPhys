@@ -5,19 +5,21 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numba
 from numba import njit, prange
+import argparse
+from pathlib import Path
 
 
 
 
 #As a test, starting with 3 meanings, 2 signals
-meanings = ["dog",
-            "cat",
-            "bird",
-            "pig"]
+# meanings = ["dog",
+#             "cat",
+#             "bird",
+#             "pig"]
 
 
-signals = ["red",
-           "blue"]
+# signals = ["red",
+#            "blue"]
 
 
 """Oftentimes I am passing variables like num_meanings and num_signals; even though these could be recalculated in one line, 
@@ -42,9 +44,13 @@ def delta(i,j):
 """Just a standard dirac delta function to be used in most of the update rules"""
 
 @njit(parallel = True)
-def update_phi(phi_array, counts_array, lambda_val, alpha, meaning_index, signal_index,num_signals):
+def update_phi_WRONG(phi_array, counts_array, lambda_val, alpha, meaning_index, signal_index,num_signals):
     """Update rule according to equation 15 in document Evolution of Communications Through Fluctuations"""
-    
+
+
+    """This is the wrong implementation of the phi update rule.  This(eq 15) is the long term analytic behavior, 
+     the model is instead supposed to update itself based upon the rules we use to initialise phi, i.e., equation 12
+      where it is soley based upon the number of observed counts at that point. """
     new_phi = np.copy(phi_array)
     sum_term =0
     for i in range(num_signals):
@@ -58,6 +64,28 @@ def update_phi(phi_array, counts_array, lambda_val, alpha, meaning_index, signal
                                             (1+(1-lambda_val)*sum_term +alpha)
         )
     return phi_array
+
+@njit
+def update_phi(signals_meaning_array, alpha_val, alpha_on_s,signal_index,num_meanings):
+    """Update rule for phi is based upon the number of observed counts, i.e., equation 12 in the notes.
+     As I understand the equation, the updates should only take place for the row corresponding to the signal observed!
+     So if the possible signals are dog and cat, and we observe signal cat, we do not touch the phi array values corresponding
+     to signal dog.
+
+     The signals are updated according to the following:
+     phi_i(s|m;t) = [(n_i(s|m;t)+alpha/S)]/(sum(n_i(s'|m;t))+alpha)
+     where sum(n_i(s'|m;t)) corresponds to the sum over signals for that possible meaning, or in othern words the sum of the column
+
+     
+     Calculates the updated phi row, and then returns this to be sliced back into the array
+       """
+    new_phi_row = np.empty(num_meanings)
+    signals_meanings_cut = signals_meaning_array[signal_index,:]
+    for m in range(num_meanings):
+        new_phi_row[m] = (signals_meanings_cut[m] +alpha_on_s)/(signals_meaning_array[:,m].sum() +alpha_val)
+
+    return new_phi_row
+
 
 @njit(parallel = True)
 def update_signal_meaning(counts_array, lambda_val, meaning_index, signal_index, num_signals):
@@ -107,16 +135,6 @@ def blind_success_outer_loop(num_agents,ensemble_phi,num_signals,num_meanings):
     p_s*=const
     return p_s
 
-# @njit(parallel = True)
-# def calculate_ensemble_count_array(num_agents, ensemble_count_array):
-#     """Calculating the ensemble average n(s|m) array"""
-#     ensemble_count = np.empty_like(ensemble_count_array[0,:]) #create a blank version of the signal_meaning array to store the new ensemble average
-#     for i in prange(num_agents):
-#         ensemble_count[:] = ensemble_count_array[i,:].sum()
-#         ensemble_count[:,:] = agent_list[i].signal_meaning_array[i,:,:].sum()
-#     ensemble_count/=num_agents
-#     return ensemble_count
-#Don't think above is helpful if I cannot pass the agent list
 
 @njit
 def numba_random_choice(array,prob):
@@ -130,10 +148,6 @@ def numba_random_choice(array,prob):
     
     """
     return array[np.searchsorted(np.cumsum(prob), np.random.random(), side="right")]
-
-
-
-
 
 
 ############################################################################################################################
@@ -204,21 +218,23 @@ class Agent:
     certainty into it at this moment
     
     """
-    def __init__(self,meanings,signals, lambda_val = 0.01, alpha=0.1, beta = 49):
-        self.num_meanings = len(meanings)
-        self.num_signals = len(signals)
-        self.meanings = np.array(meanings)
-        self.signals = np.array(signals)
+    def __init__(self,meanings,signals, lambda_val, alpha, beta,num_meanings, num_signals,):
+        self.num_meanings = num_meanings
+        self.num_signals = num_signals
+        
         self.lambda_val = lambda_val
 
-        self.meanings_list = meanings
-        self.signals_list = signals
+        self.meanings = meanings
+        self.meanings_list = meanings.tolist()
+        
+        self.signals = signals
+        self.signals_list = signals.tolist()
 
         #Need some list of integers to pass to the numba functions corresponding to the meanings and signal distributions
         self.meanings_integers = np.arange(self.num_meanings, dtype=int)
-        print(self.meanings_integers)
+        # print(self.meanings_integers)
         self.signals_integers = np.arange(self.num_signals,dtype=int)
-        print(self.signals_integers)
+        # print(self.signals_integers)
 
         self.Alpha = alpha
         self.Alpha_s = alpha/self.num_signals
@@ -317,15 +333,6 @@ class Agent:
     def update_counts(self, nu_idx, signal_idx):
         """Update rule is that all values in the signal_meaning_array decay by (1-lambda)*current_value, 
         with the exception of the actual signal, which while it does decay, is also incremented by 1. """
-        # print("phi array before")
-        # print(self.phi_array)
-        #Now updating the posterior distribution
-        # nu_idx = self.meanings_list.index(interpreted_nu)
-
-        self.phi_array = update_phi(self.phi_array,self.signal_meaning_array,self.lambda_val,
-                                    self.Alpha,nu_idx,signal_idx,self.num_signals)
-        # print("phi array after")
-        # print(self.phi_array)
 
         #Now updating the counts array
         # print("Counts array before")
@@ -334,18 +341,25 @@ class Agent:
                                                           nu_idx,signal_idx,self.num_signals)
         # print("Counts after")
         # print(self.signal_meaning_array)
-        
+        """Phi is calcualted based upon the counts array, so updating phi must come after we update the signal meaning array"""
+        new_phi_row = update_phi(self.signal_meaning_array,self.Alpha,self.Alpha_s,signal_idx,self.num_meanings)
+        self.phi_array[signal_idx,:] = new_phi_row
         
 
 
 class Ensemble:
     """Create a class responsible for the ensemble of agents, such that measuring and analyzing communicative values are easier."""
-    def __init__(self, num_agents, agent_fn, alignment, number_signals, number_meanings):
+    def __init__(self, num_agents, agent_fn, alignment, number_signals, number_meanings, savefig,output_dir,showfig):
         self.A = alignment
         self.agent_ids = np.arange(num_agents)
         self.number_agents = num_agents
         self.num_signals = number_signals
         self.num_meanings = number_meanings
+        self.savefig = savefig
+        self.show = showfig
+        self.output_dir = Path(output_dir)
+
+        self.steady_state_iteration =0
 
         self.agent_list = [agent_fn() for _ in range(num_agents)]
         #Creates the initial list of agents
@@ -357,6 +371,17 @@ class Ensemble:
         self.numba_warmup()
         self.gain_epochs = []
         self.gain_values = []
+
+
+    # def create_rho_generations(self)
+
+    def plot_save_or_show(self, fig, name):
+        """A helper function to be called after creating a figure in any of the below functions.  Determines what to do with the created figure"""
+        if self.savefig:
+            fig.savefig(self.output_dir / f"{name}.png")
+        if self.show:
+            plt.show()
+        plt.close(fig)
 
 
 
@@ -376,8 +401,8 @@ class Ensemble:
         print("Testing delta")
         delta(1,1)
         print("Testing update_phi")
-        update_phi(selected_agent.phi_array,selected_agent.signal_meaning_array,selected_agent.lambda_val,
-                   selected_agent.Alpha,1,1,selected_agent.num_signals)
+        update_phi(selected_agent.signal_meaning_array,
+                   selected_agent.Alpha,selected_agent.Alpha_s,1,selected_agent.num_meanings)
 
         print("Testing update_signal meaning")
         update_signal_meaning(selected_agent.signal_meaning_array,selected_agent.lambda_val,1,1,selected_agent.num_signals)  
@@ -439,8 +464,9 @@ class Ensemble:
         ax.set_xlabel("Meanings")
         ax.set_ylabel("Signals")
         ax.set_title(f"Counts of Signals vs Meaning for $\lambda$ = {lambda_val}")
-        plt.savefig(fr"C:/Users/Logan/Downloads/MPhys/Plots/ensemble_counts_lambda{lambda_val}.png")
-        plt.close()
+        name = f"Ensemble_Counts_Lambda{lambda_val}.png"
+        self.plot_save_or_show(fig,name)
+        # plt.savefig(fr"C:/Users/Logan/Downloads/MPhys/Plots/ensemble_counts_lambda{lambda_val}.png")
 
     def plot_communication_gain(self):
         lambda_val = self.agent_list[0].lambda_val
@@ -449,59 +475,75 @@ class Ensemble:
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Communication Gain")
         ax.set_title(f"Communication Gain vs Time for $\lambda$ = {lambda_val}")
-        plt.savefig(fr"C:/Users/Logan/Downloads/MPhys/Plots/Gain_{lambda_val}.png")
-        plt.close()
+        name = f"Communication_Gain_lambda{lambda_val}"
+        self.plot_save_or_show(fig,name)
 
     def training_loop(self,iterations):
+        converged = False
         for i in range(iterations):
             self.one_interaction()
-            if ((i>0) and (i%50000 ==0)):
+            if ((i>0) and (i%100000 ==0)):
                 print(f"On iteration {i}")
                 self.update_ensemble_arrays()
                 
                 p_s = self.measure_blind_success()
                 gain = ((self.num_meanings*p_s) -1)/(self.num_signals-1)
+                if (gain>=0.80) and (converged ==False):
+                    print("Steady state reached")
+                    self.steady_state_iteration = i
+                    converged = True
                 self.gain_values.append(gain)
                 self.gain_epochs.append(i)
 
         ensemble_average_counts = np.mean(self.ensemble_counts, axis = 0)
         self.plot_communication_gain()
         self.plot_ensemble_counts(ensemble_avg=ensemble_average_counts)
+        if converged:
+            print(f"Steady state iteration is {self.steady_state_iteration}")
+        
         
 
 
 
 if __name__ =="__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--NumMeanings', type = int, help="Determines the numbers of meanings to be created/used in the case where meanings are not" \
+    "hardcoded", default=12)
+    parser.add_argument('--NumSignals', type = int, help="Determines the numbers of signals to be created/used in the case where signals are not" \
+    "hardcoded", default=6)
+    parser.add_argument('--NumAgents', type = int, help="Determines the numbers of communicating/learning agents", default=5)
+    parser.add_argument('--Beta', type = int, help="Determines the value of parameter beta", default=49)
+    parser.add_argument('--Alpha', type = float, help="Determines the value of parameter alpha", default=0.1)
+    parser.add_argument('--lambda_val', type = float, help="Determines the value of lambda, or the forgetting rate of the models", default=0.01)
+    parser.add_argument('--alignment', type = float, help="Determines the alignment between models", default=1.0)
+    parser.add_argument('--iterations', type=float, help = "Determines how many millions of iterations to run the code for", default = 4)
+    parser.add_argument('--OutputDir', type = str, help = 'Determines the file output of saved plots, data, etc', 
+                            default =str(Path.home()/"Downloads"/"MPhys/Plots"))
+    parser.add_argument('--Filename', type = str, help='Determines the file to save data to', default= 'Unsorted')
+    parser.add_argument('--SaveFig', action='store_true', help='If set, saves figures to args.Filename')
+    parser.add_argument('--ShowFig', action='store_true', help='If set, shows figures')
+
+    args = parser.parse_args()
+
+    total_iterations = int(args.iterations * 1000000)
+    
+    output_directory = Path(args.OutputDir)/args.Filename
+    output_directory.mkdir(parents = True, exist_ok = True)#Creates the folder if it does not already exist
 
 
 
-    # send_agent = Agent(meanings=meanings,signals=signals,lambda_val=0.001)
-    # receive_agent = Agent(meanings=meanings,signals=signals,lambda_val=0.001)
-    num_signals = len(signals)
-    num_meanings = len(meanings)
-    #Initial compiling of numba functions  
-    agent_func = lambda : Agent(meanings,signals, lambda_val=0.1)
+    """Initialise the meanings and signals list if they have not been done"""
+    meanings = np.arange(args.NumMeanings)
 
-    Test_ensemble = Ensemble(5,agent_func,1,num_signals,num_meanings)
-    Test_ensemble.training_loop(iterations=3000000)
+    signals = np.arange(args.NumSignals)
+
+      
+    agent_func = lambda : Agent(meanings,signals,args.lambda_val,args.Alpha,args.Beta,args.NumMeanings,args.NumSignals)
+
+    Test_ensemble = Ensemble(args.NumAgents,agent_func,args.alignment,args.NumSignals,args.NumMeanings,args.SaveFig,output_directory,args.ShowFig)
+    Test_ensemble.training_loop(iterations=total_iterations)
     # Test_ensemble.one_interaction()
     
-    #Testing numpy dirichlet dist
-    # beta = 49
-    # alpha_dist = np.full(num_meanings, (beta/num_meanings))
-    # inst_dirichlet = np.random.dirichlet(alpha_dist)
-    # print(inst_dirichlet)
-
-
-    # prob_dist_test = np.array([0.35,0.5,0.15])
-    # array_test = np.array([1,2,3])
-    # warmup = numba_random_choice(array_test,prob_dist_test)
-    # counts_array = np.zeros((3,))
-    # for i in range(100000000):
-    #     randomdraw = numba_random_choice(array_test,prob_dist_test)
-    #     counts_array[randomdraw-1]+=1
-    # print(counts_array)
-
 
     
 
