@@ -197,7 +197,7 @@ def receive_signal_integers_njit(signal_idx,A,passed_rho_dist,alpha_dist,phi_arr
     # print(denom)
     posterior_dist = np.zeros(num_meanings, dtype=np.float64)
     for j in range(num_meanings):
-        inst_val = (phi_s_mu[j]*rho_dist[j])/denom
+        # inst_val = (phi_s_mu[j]*rho_dist[j])/denom
         # print("inst_val")
         # print(inst_val)
         posterior_dist[j] = ((phi_s_mu[j]*rho_dist[j])/denom)
@@ -369,7 +369,7 @@ class Ensemble:
             self.number_of_gens = num_generations
             self.gamma=gamma
             self.gen_probs = generation_probs
-            generation_rhos= self.create_rho_generations(num_generations=num_generations, beta=beta,gamma=gamma,number_focuses=number_focuses)
+            generation_rhos= self.create_rho_generations(num_generations=num_generations, beta=beta,gamma=gamma,number_focuses=number_focuses, unique_focuses=True)
             self.agent_list = []
             number_of_generations = np.arange(num_generations)
             for i in range(num_agents):
@@ -395,17 +395,24 @@ class Ensemble:
         self.gain_values = []
 
 
-    def create_rho_generations(self,num_generations,beta,gamma, number_focuses = 2):
+    def create_rho_generations(self,num_generations,beta,gamma, number_focuses = 2, unique_focuses = False):
         """A function to create the rho distributions for each generation at an ensemble level, to then distribute to each agent on 
         a probabilistic basis.  """
 
         focuses_array = np.empty((num_generations,number_focuses))# make an array to assure that no generations are looking at the same thing
 
-        meanings = np.arange(self.num_meanings)
+        meanings = np.arange(self.num_meanings).tolist()
         generation_rho_array = np.empty((num_generations,self.num_meanings)) #Dimensionality [number of generation, rho array]
         for i in range(num_generations):
             selected_focuses = np.random.choice(meanings,size =number_focuses, replace = False)
             
+            
+            if unique_focuses:
+                """If we want unique focuses, remove the selected focuses from the list of possible meanings to choose from"""
+                for j in range(number_focuses):
+                    meanings.remove(selected_focuses[j])
+
+
             print(f"Focuses of generation {i} are {selected_focuses}")
             base_counts = np.full(self.num_meanings, (beta/self.num_meanings))
             for focus in selected_focuses:
