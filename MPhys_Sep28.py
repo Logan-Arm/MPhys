@@ -8,6 +8,9 @@ from numba import njit, prange
 import argparse
 from pathlib import Path
 import pandas as pd
+import json
+import h5py
+
 
 
 
@@ -43,28 +46,6 @@ def numba_col_sum(array,mu_index):
 def delta(i,j):
     return 1 if i==j else 0
 """Just a standard dirac delta function to be used in most of the update rules"""
-
-@njit(parallel = True)
-def update_phi_WRONG(phi_array, counts_array, lambda_val, alpha, meaning_index, signal_index,num_signals):
-    """Update rule according to equation 15 in document Evolution of Communications Through Fluctuations"""
-
-
-    """This is the wrong implementation of the phi update rule.  This(eq 15) is the long term analytic behavior, 
-     the model is instead supposed to update itself based upon the rules we use to initialise phi, i.e., equation 12
-      where it is soley based upon the number of observed counts at that point. """
-    new_phi = np.copy(phi_array)
-    sum_term =0
-    for i in range(num_signals):
-        sum_term+=counts_array[i,meaning_index]
-    #Sum over all signals observed to be used for meaning m
-
-    for j in prange(num_signals):
-        phi_array[j,meaning_index] = (
-            phi_array[j,meaning_index] + (delta(signal_index,j=j) -phi_array[j,meaning_index] +
-                                          lambda_val*alpha*(1/num_signals -phi_array[j,meaning_index]))/
-                                            (1+(1-lambda_val)*sum_term +alpha)
-        )
-    return phi_array
 
 @njit
 def update_phi(signals_meaning_array, alpha_val, alpha_on_s,signal_index,num_meanings):
@@ -219,23 +200,24 @@ class Agent:
     certainty into it at this moment
     
     """
-    def __init__(self,meanings,signals, lambda_val, alpha, beta,num_meanings, num_signals,passed_rho = None):
+    def __init__(self,meanings,signals, lambda_val, alpha, beta,num_meanings, num_signals,passed_counts = None, generation_tag =0):
         self.num_meanings = num_meanings
         self.num_signals = num_signals
         
         self.lambda_val = lambda_val
 
         self.meanings = meanings
-        self.meanings_list = meanings.tolist()
         
         self.signals = signals
-        self.signals_list = signals.tolist()
 
-        #Need some list of integers to pass to the numba functions corresponding to the meanings and signal distributions
+        self.generation_tag = generation_tag #A identifier for which generation this particular agent corresponds to
+
         self.meanings_integers = np.arange(self.num_meanings, dtype=int)
-        # print(self.meanings_integers)
         self.signals_integers = np.arange(self.num_signals,dtype=int)
-        # print(self.signals_integers)
+        """In most cases, signal and meaning integers are entirely the same.  It has however been left in the code,
+        as if there is ever any desire to further complicate signals/meanings (multi-character signals, more than one signal
+        being communicated in one instance of communication, etc.), this is a valuable array to simplify computations"""
+
 
         self.Alpha = alpha
         self.Alpha_s = alpha/self.num_signals
@@ -243,92 +225,23 @@ class Agent:
         self.beta = beta
 
         self.certainty = 1/(1+beta)
-        if passed_rho is not None:
-            self.alpha_dist = passed_rho
+        if passed_counts is not None:
+            self.alpha_dist = passed_counts
         else:
             self.alpha_dist = np.full(self.num_meanings, (beta/self.num_meanings))
         # print(self.alpha_dist)
         
         #Above is to be used for the rho distributions, it has no bearing on the self.Alpha value
+        # print(f"The agent alpha array  is of form {self.alpha_dist.dtype}, and shape {self.alpha_dist.shape}")
 
         self.signal_meaning_array = np.zeros((self.num_signals,self.num_meanings)) #Initialises a zero array of size S X M
-        """The signal meaning array tracks how many times an agent has received signal s when they interpreted meaning m
-        
-        In our specific case, signal_meaning_array[0,1] corresponds to the number of times the agent has received the signal
-        'red', when the meaning they believe the signaller intends is 'cat'"""
-
-
-#####################################################################################
-        #Double check this
+        """The signal meaning array tracks how many times an agent has received signal s when they interpreted meaning m"""
         self.phi_array = np.full((self.num_signals,self.num_meanings),fill_value= (1/self.num_signals))
         """At initialisation the phi array is uniformally distributed such that all signals are equally likely"""
-
-    def select_signal_numpy(self):
-        """A function to be used when this agent is chosen to select a signal to send"""
-
-        inst_rho = sc.stats.dirichlet.rvs(alpha = self.alpha_dist, size = 1).squeeze()
-        ###
-        #Double check size = 1 is wanted here
-        ###
-        # print(f"inst_rho is {inst_rho}")
-        #Creates an attentional weight distribution over all the meanings
-
-        selected_mu = np.random.choice(self.meanings, p=inst_rho)
-        # print(f"Selected mu is {selected_mu}")
-
-        mu_idx = self.meanings_list.index(selected_mu)
-
-        signal_prob = self.phi_array[:,mu_idx]
-
-        selected_signal = np.random.choice(self.signals,p=signal_prob)
-        # print(f"The selected signal is {selected_signal}")
-        ###
-        #Double check this is the correct way to go about choosing the signal
-        ###
-
-        return selected_signal, inst_rho,
 
     def select_signal_numba(self):
         selected_signal, inst_rho = select_signal_integers_njit(self.alpha_dist,self.phi_array,self.meanings_integers,self.signals_integers)
         return selected_signal,inst_rho
-
-    def receive_signal(self, signal, rho_distribution,A):
-        """In future, break this up into two functions, one where we need to re-generate rho, and one where we don't"""
-        rho_roll = np.random.rand()
-        if rho_roll<=A:
-            inst_rho = rho_distribution
-        else:
-            inst_rho = sc.stats.dirichlet.rvs(alpha = self.alpha_dist, size = 1).squeeze()
-            print("Recalculating Rho")
-
-
-        """Interpretation rule works by having each agent work under the framework of calculating their own likelihood of
-        using the inputted signal to convey a meaning"""
-
-        ###
-        #I imagine this posterior chain is where numba is really necessary
-        ###
-
-
-        signal_idx = self.signals_list.index(signal)
-        # print(f"Received signal idx is {signal_idx}")
-        phi_s_mu = self.phi_array[signal_idx,:] #Grabs vector containing the likelihood of using signal corresponding to signal idx for each meaning
-        denom = (phi_s_mu * inst_rho).sum()
-        # if np.abs(denom-1) >= 1e-3:
-        #     print("Signal denominator larger than 1") 
-
-        posterior_dist = np.empty((self.num_meanings,))
-        # print(f"Shape of posterio dist is {posterior_dist.shape}")
-
-        for j in range(self.num_meanings):
-            posterior_dist[j] = (phi_s_mu[j] * inst_rho[j])/denom
-
-        # print(f"Posterior dist is {posterior_dist}")
-        # print(f"Sum of post dist is {np.sum(posterior_dist)}")
-        
-        nu = np.random.choice(self.meanings, p=posterior_dist)
-        # print(f"Selected meaning is {nu}")
-        return nu, signal_idx
 
     def receive_signal_numba(self,signal_idx,rho_dist,A):
         nu_idx = receive_signal_integers_njit(signal_idx,A,rho_dist,self.alpha_dist,self.phi_array,self.meanings_integers,self.num_meanings)
@@ -337,13 +250,9 @@ class Agent:
         """Update rule is that all values in the signal_meaning_array decay by (1-lambda)*current_value, 
         with the exception of the actual signal, which while it does decay, is also incremented by 1. """
 
-        #Now updating the counts array
-        # print("Counts array before")
-        # print(self.signal_meaning_array)
         self.signal_meaning_array = update_signal_meaning(self.signal_meaning_array,self.lambda_val,
                                                           nu_idx,signal_idx,self.num_signals)
-        # print("Counts after")
-        # print(self.signal_meaning_array)
+
         """Phi is calcualted based upon the counts array, so updating phi must come after we update the signal meaning array"""
         new_phi_row = update_phi(self.signal_meaning_array,self.Alpha,self.Alpha_s,signal_idx,self.num_meanings)
         self.phi_array[signal_idx,:] = new_phi_row
@@ -353,7 +262,8 @@ class Agent:
 class Ensemble:
     """Create a class responsible for the ensemble of agents, such that measuring and analyzing communicative values are easier."""
     def __init__(self, num_agents, agent_fn, alignment, number_signals, number_meanings, savefig,output_dir,showfig, 
-                 create_rhos = False, num_generations = 2, beta = 49, gamma = 2, generation_probs = None, number_focuses = 2):
+                 generation_count_dists= False, num_generations = 1, beta = 49, gamma = 2, generation_probs = None, number_focuses = 2,
+                 generation_overlap = False):
         self.A = alignment
         self.agent_ids = np.arange(num_agents)
         self.number_agents = num_agents
@@ -364,20 +274,19 @@ class Ensemble:
         self.output_dir = Path(output_dir)
 
 
-        if create_rhos:
+        if generation_count_dists:
+            """Currently this is only configured such that we take 1 generation to start with, once a steady state is reached,
+            more generations will be formed, although this will of course not occur in the init"""
+            self.possible_focuses = np.arange(self.num_meanings).tolist()
             self.has_generations=True
             self.number_of_gens = num_generations
             self.gamma=gamma
             self.gen_probs = generation_probs
-            generation_rhos= self.create_rho_generations(num_generations=num_generations, beta=beta,gamma=gamma,number_focuses=number_focuses, unique_focuses=True)
-            self.agent_list = []
-            number_of_generations = np.arange(num_generations)
-            for i in range(num_agents):
-                inst_gen = np.random.choice(number_of_generations,p=generation_probs)
-                self.agent_list.append(agent_fn(passed_rho = generation_rhos[inst_gen,:]))
+            generation_counts,discard= self.create_generation_counts(beta=beta,gamma=gamma,possible_focuses=self.possible_focuses,number_focuses=number_focuses)
+
+            self.agent_list = [agent_fn(passed_counts = generation_counts) for _ in range(num_agents)]
 
 
-            
         else:
             self.has_generations=False
             self.number_of_gens = 0
@@ -394,15 +303,12 @@ class Ensemble:
         self.gain_epochs = []
         self.gain_values = []
 
-
-    def create_rho_generations(self,num_generations,beta,gamma, number_focuses = 2, unique_focuses = False):
+    def create_counts_generations(self,num_generations,beta,gamma, number_focuses = 2, unique_focuses = False):
         """A function to create the rho distributions for each generation at an ensemble level, to then distribute to each agent on 
         a probabilistic basis.  """
 
-        focuses_array = np.empty((num_generations,number_focuses))# make an array to assure that no generations are looking at the same thing
-
         meanings = np.arange(self.num_meanings).tolist()
-        generation_rho_array = np.empty((num_generations,self.num_meanings)) #Dimensionality [number of generation, rho array]
+        generation_attentional_counts_array = np.empty((num_generations,self.num_meanings)) #Dimensionality [number of generation, rho array]
         for i in range(num_generations):
             selected_focuses = np.random.choice(meanings,size =number_focuses, replace = False)
             
@@ -417,10 +323,23 @@ class Ensemble:
             base_counts = np.full(self.num_meanings, (beta/self.num_meanings))
             for focus in selected_focuses:
                 base_counts[focus]*=gamma
-            generation_rho_array[i,:] = base_counts
+            generation_attentional_counts_array[i,:] = base_counts
 
-        return generation_rho_array
-    
+        return generation_attentional_counts_array
+
+    def create_generation_counts(self,beta,gamma, possible_focuses,number_focuses =2):
+        """A function to return attentional counts, modified by a select number of attentional focuses, for a generation.  
+        Focuses are selected randomly from an inputted list of allowed focuses.  The degree to which these counts are modifed
+        ('focused on') comes from the parameter gamma, which is a straighforward multiplier of the number of counts.  All meanings
+        not within the group of selected focuses have a count value corresponding to beta/M where M is total number of meanings.
+        """
+        selected_focuses = np.random.choice(possible_focuses,size = number_focuses, replace =False)
+        gen_counts = np.full(self.num_meanings,(beta/self.num_meanings))
+        for focus in selected_focuses:
+            gen_counts[focus] *=gamma
+        # print(f"Gen_counts has datatype {gen_counts.dtype}")
+        return gen_counts, selected_focuses
+
     def plot_save_or_show(self, fig, name):
         """A helper function to be called after creating a figure in any of the below functions.  Determines what to do with the created figure"""
         if self.savefig:
@@ -519,6 +438,11 @@ class Ensemble:
         self.plot_save_or_show(fig,name)
 
     def training_loop(self,iterations):
+
+        #Initialise the files to save the data in
+        self.generate_initial_h5_file()
+
+
         converged = False
         for i in range(iterations):
             self.one_interaction()
@@ -535,14 +459,16 @@ class Ensemble:
                 self.gain_values.append(gain)
                 self.gain_epochs.append(i)
 
+                # self.save_to_file(iteration= i) 
+
         ensemble_average_counts = np.mean(self.ensemble_counts, axis = 0)
         self.plot_communication_gain()
         self.plot_ensemble_counts(ensemble_avg=ensemble_average_counts)
         if converged:
             print(f"Steady state iteration is {self.steady_state_iteration}")
-        self.save_data(iterations,converged)
+        self.save_params(iterations,converged)
         
-    def save_data(self,iterations,convergence):
+    def save_params(self,iterations,convergence):
         params_dict = {'num_meanings': self.num_meanings,
                        'num_signals': self.num_signals,
                        'num_agents': self.number_agents,
@@ -561,6 +487,52 @@ class Ensemble:
         params_df.to_csv(params_file, index=False)
         print(f"Saved simulation parameters to {params_file}")        
 
+    def add_new_gens(self,number_of_added_members, delete_old = 0):
+        """A function to add members of a new generation to the agent list, as well as delete older members """
+        
+
+    def save_to_file(self, iteration: int = None):
+        """Save the experimental data to a file as it is calculated/experiment is performed"""
+        save_dir = self.output_dir/"raw"
+        save_dir.mkdir(parents = True, exist_ok = True)
+
+
+        meta_data = {
+            "num_agents": len(self.agent_list),
+            "num_signals": self.num_signals,
+            "num_meanings": self.num_meanings,
+            "lambda_val": self.agent_list[0].lambda_val
+        }
+        with open(save_dir/"metadata.json","w") as f:
+            json.dump(meta_data,f,indent=4)
+
+
+        if hasattr(self,"gain_values"):
+            pd.DataFrame({"epoch": self.gain_epochs, "gain": self.gain_values}).to_csv(save_dir / "gain_values.csv",
+                                                                                        index=False)
+
+        if iteration is not None:
+            np.save(save_dir / f"ensemble_counts_iteration{iteration}.npy",self.ensemble_counts.mean(axis = 0) )
+
+        np.save(save_dir / f"ensemble_phi_iteration{iteration}.npy",self.ensemble_phi.mean(axis = 0) )
+
+    def generate_initial_h5_file(self):
+        """Generates the h5_file used to store data as the experiment runs"""
+        self.h5_file = h5py.File(name =self.output_dir/"array_data.h5", mode = 'w')
+        self.h5_phi_group = self.h5_file.create_group(name = 'Phi')
+        self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (1, self.num_signals, self.num_meanings), 
+                                                     maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+        self.h5_phi_dataset.attrs['description'] = 'Ensemble phi arrays over time'
+        self.h5_phi_dataset.attrs['num_signals'] = self.num_signals
+        self.h5_phi_dataset.attrs['num_meanings'] = self.num_meanings
+
+
+        self.h5_signal_meanings_group = self.h5_file.create_group(name = 'signal_meaning')
+        self.h5_signal_meanings_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meaning_dataset', shape = (1, self.num_signals, self.num_meanings), 
+                                                     maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+        self.h5_signal_meanings_dataset.attrs['description'] = "Ensemble signal meaning count array over time "
+        self.h5_signal_meanings_dataset.attrs['num_signals'] = self.num_signals
+        self.h5_signal_meanings_dataset.attrs['num_meanings'] = self.num_meanings
 
 
 if __name__ =="__main__":
@@ -581,7 +553,7 @@ if __name__ =="__main__":
     parser.add_argument('--SaveFig', action='store_true', help='If set, saves figures to args.Filename')
     parser.add_argument('--ShowFig', action='store_true', help='If set, shows figures')
     parser.add_argument('--Generations', action='store_true', help='If set, have independent generations rho distributions')
-    parser.add_argument('--GenCount', type = int, help="Determines the number of generations", default=2)
+    parser.add_argument('--GenCount', type = int, help="Determines the number of generations", default=1)
     parser.add_argument('--gamma', type = int, help="Determines the parameter gamma, which controls \
                         how much the generational focus is multiplied by", default=2)
     parser.add_argument('--Focuses', type = int, help="Determines how many focuses are in each generation", default=2)
