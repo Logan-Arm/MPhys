@@ -15,15 +15,6 @@ import h5py
 
 
 
-#As a test, starting with 3 meanings, 2 signals
-# meanings = ["dog",
-#             "cat",
-#             "bird",
-#             "pig"]
-
-
-# signals = ["red",
-#            "blue"]
 
 
 """Oftentimes I am passing variables like num_meanings and num_signals; even though these could be recalculated in one line, 
@@ -439,6 +430,7 @@ class Ensemble:
 
     def training_loop(self,iterations):
 
+        self.update_ensemble_arrays()
         #Initialise the files to save the data in
         self.generate_initial_h5_file()
 
@@ -449,7 +441,12 @@ class Ensemble:
             if ((i>0) and (i%100000 ==0)):
                 print(f"On iteration {i}")
                 self.update_ensemble_arrays()
-                
+
+                if i== 2500000:
+                    self.test_phi_h5 = self.ensemble_phi.mean(axis = 0)
+                    self.test_counts_h5 = self.ensemble_counts.mean(axis = 0)
+                    self.h5_test_i = i//100000
+                    
                 p_s = self.measure_blind_success()
                 gain = ((self.num_meanings*p_s) -1)/(self.num_signals-1)
                 if (gain>=0.80) and (converged ==False):
@@ -459,11 +456,11 @@ class Ensemble:
                 self.gain_values.append(gain)
                 self.gain_epochs.append(i)
 
-                # self.save_to_file(iteration= i) 
+                self.save_to_file(iteration= i) 
 
         ensemble_average_counts = np.mean(self.ensemble_counts, axis = 0)
-        self.plot_communication_gain()
-        self.plot_ensemble_counts(ensemble_avg=ensemble_average_counts)
+        # self.plot_communication_gain()
+        # self.plot_ensemble_counts(ensemble_avg=ensemble_average_counts)
         if converged:
             print(f"Steady state iteration is {self.steady_state_iteration}")
         self.save_params(iterations,converged)
@@ -512,13 +509,21 @@ class Ensemble:
                                                                                         index=False)
 
         if iteration is not None:
-            np.save(save_dir / f"ensemble_counts_iteration{iteration}.npy",self.ensemble_counts.mean(axis = 0) )
+            """If iteration is not none, we append the data we found to the h5py file we initialised earlier"""
+            current_phi_iter_val = self.h5_phi_dataset.shape[0]
+            current_counts_iter_val =self.h5_signal_meanings_dataset.shape[0]
 
-        np.save(save_dir / f"ensemble_phi_iteration{iteration}.npy",self.ensemble_phi.mean(axis = 0) )
-
+            self.h5_phi_dataset.resize(current_phi_iter_val+1,axis=0)
+            self.h5_signal_meanings_dataset.resize(current_counts_iter_val+1,axis=0)
+            self.h5_phi_dataset[current_phi_iter_val,:,:] = self.ensemble_phi.mean(axis = 0)
+            self.h5_signal_meanings_dataset[current_counts_iter_val,:,:] = self.ensemble_counts.mean(axis = 0)
+   
     def generate_initial_h5_file(self):
-        """Generates the h5_file used to store data as the experiment runs"""
-        self.h5_file = h5py.File(name =self.output_dir/"array_data.h5", mode = 'w')
+        """Generates the h5_file used to store data as the experiment runs, should only be 
+        used after the initial ensemble arrays have been calculated"""
+        save_dir = self.output_dir/"raw"
+        save_dir.mkdir(parents = True, exist_ok = True)
+        self.h5_file = h5py.File(name =save_dir/"array_data.h5", mode = 'w')
         self.h5_phi_group = self.h5_file.create_group(name = 'Phi')
         self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (1, self.num_signals, self.num_meanings), 
                                                      maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
@@ -526,13 +531,36 @@ class Ensemble:
         self.h5_phi_dataset.attrs['num_signals'] = self.num_signals
         self.h5_phi_dataset.attrs['num_meanings'] = self.num_meanings
 
+        self.h5_phi_dataset[0,:,:] = self.ensemble_phi.mean(axis =0)
+
 
         self.h5_signal_meanings_group = self.h5_file.create_group(name = 'signal_meaning')
-        self.h5_signal_meanings_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meaning_dataset', shape = (1, self.num_signals, self.num_meanings), 
+        self.h5_signal_meanings_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meanings_dataset', shape = (1, self.num_signals, self.num_meanings), 
                                                      maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
         self.h5_signal_meanings_dataset.attrs['description'] = "Ensemble signal meaning count array over time "
         self.h5_signal_meanings_dataset.attrs['num_signals'] = self.num_signals
         self.h5_signal_meanings_dataset.attrs['num_meanings'] = self.num_meanings
+
+        self.h5_signal_meanings_dataset[0,:,:] = self.ensemble_counts.mean(axis =0)
+
+
+    def test_h5_file(self):
+        file_dir = self.output_dir/"raw"
+        with h5py.File(file_dir/"array_data.h5", 'r') as f:
+            phi_group = f['Phi']
+            counts_group = f['signal_meaning']
+
+            phi_data = phi_group['phi_dataset'][:]
+            counts_data = counts_group["signal_meanings_dataset"][:]
+
+        test_recorded_phi = phi_data[self.h5_test_i,:,:]
+        test_recorded_counts = counts_data[self.h5_test_i,:,:]
+
+        difference_phi = test_recorded_phi - self.test_phi_h5
+        difference_counts = test_recorded_counts-self.test_counts_h5
+
+        print(f"Maximum phi difference is {np.max(difference_phi)}")
+        print(f"Maximum counts difference is {np.max(difference_counts)}")
 
 
 if __name__ =="__main__":
@@ -548,7 +576,7 @@ if __name__ =="__main__":
     parser.add_argument('--alignment', type = float, help="Determines the alignment between models", default=1.0)
     parser.add_argument('--iterations', type=float, help = "Determines how many millions of iterations to run the code for", default = 4)
     parser.add_argument('--OutputDir', type = str, help = 'Determines the file output of saved plots, data, etc', 
-                            default =str(Path.home()/"Downloads"/"MPhys/Plots"))
+                            default =str(Path.home()/"Downloads"/"MPhys/Code_Runs"))
     parser.add_argument('--Filename', type = str, help='Determines the file to save data to', default= 'Unsorted')
     parser.add_argument('--SaveFig', action='store_true', help='If set, saves figures to args.Filename')
     parser.add_argument('--ShowFig', action='store_true', help='If set, shows figures')
@@ -581,6 +609,7 @@ if __name__ =="__main__":
     Test_ensemble = Ensemble(args.NumAgents,agent_func,args.alignment,args.NumSignals,args.NumMeanings,args.SaveFig,
                              output_directory,args.ShowFig,args.Generations,generation_probs=gen_probs,number_focuses=args.Focuses)
     Test_ensemble.training_loop(iterations=total_iterations)
+    # Test_ensemble.test_h5_file()
     # Test_ensemble.one_interaction()
     
 
