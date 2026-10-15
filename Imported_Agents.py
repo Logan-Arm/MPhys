@@ -246,29 +246,50 @@ class Imported_Ensemble:
     """A class very similar to the base ensmeble class, except for the fact that it allows for the importing of already established agent networks.
     This allows us to skip tedious, uninteresting monogenerational runs to baseline, speeding up computation time significantly.  Additionally, this 
      creates the ability to control our studies, as all increased generational trials can be done on the same configuration. """
-    def __init__(self, read_dir,agent_fn,output_dir, generation_overlap = False, export_agents = False):
+    def __init__(self, read_dir,agent_fn,output_dir, iterations, time_resolution = 100000, generation_overlap = False, export_agents = False, new_gamma = None):
         
         self.param_dir = Path(read_dir)
         self.raw_dir = Path(read_dir)/"raw"
         self.output_dir = Path(output_dir)
         self.agent_fn = agent_fn
         self.export_agents = export_agents
+        self.gamma = new_gamma
+
+        self.time_resolution = time_resolution
+        self.iterations = iterations
+        self.num_measurements = iterations/time_resolution
+
+        self.agents_list = []
+
+
+        self.gen_alpha_dists = []
+
+        #List to store the alpha arrays of each generation
+
+        self.gen_agent_dict = {}
+
         self.read_param_file()
         print(self.gen_focuses) #test
         self.possible_focuses = np.arange(self.num_meanings).tolist()
-        for i in range(len(self.gen_focuses)):
-            for j in range(len(self.gen_focuses[0])):
-                focus = self.gen_focuses[i][j]
-                self.possible_focuses.remove(focus)
         print(self.possible_focuses) # test
 
-        print(f"number of different generation focus sets is {len(self.gen_focuses)}, the amount of focuses per each gen is{len(self.gen_focuses[0])}")
-        self.num_gens = len(self.gen_focuses)
-        self.recreate_agents()
+        # print(f"number of different generation focus sets is {len(self.gen_focuses)}, the amount of focuses per each gen is {len(self.gen_focuses[0])}")
+        self.num_gens = len(self.gen_focuses)-1
+        #Set to be -1 so I can use it as a dict index easier
+
+
+        if hasattr(self,'imported_gamma'):
+            print("Gamma supplied, using imported_gamma")
+            self.recreate_agents(gamma = self.imported_gamma)
+        else:
+            print(f"No gamma supplied")
+            self.recreate_agents()
+        # self.recreate_agents()
+
+        # print(f"Gen alpha distribution is {self.gen_alpha_dists}")
         self.num_agents = len(self.agents_list)
 
         self.numba_warmup()
-
 
     def read_param_file(self):
         """Reads the inputted parameter.csv file and updates/records the relevant ensemble parameter values accordingly"""
@@ -279,7 +300,13 @@ class Imported_Ensemble:
         self.num_imported_agents = params_df['num_agents'][0]
         self.imported_gens_lambda = params_df['lambda'][0]
         self.beta = params_df['beta'][0]
-        self.gamma = params_df['gamma'][0]
+       
+        old_gamma = params_df['gamma'][0]
+        if self.gamma is None:
+            self.gamma = old_gamma
+        else:
+            self.imported_gamma = old_gamma
+
         self.gen_focuses = params_df['generation_focuses'].apply(ast.literal_eval)[0]
         self.A = params_df['alignment'][0]
         #Need the extra handling to convert the csv's string back into an actual python list
@@ -287,20 +314,57 @@ class Imported_Ensemble:
 
         # print(self.num_signals,self.num_imported_agents,self.imported_gens_lambda,self.beta,self.gamma,self.imported_gens_focuses,self.certainty)
 
-    def recreate_agents(self):
+    def create_generation_counts(self,number_focuses = 2, supplied_focuses = None,remove_focuses = True, gamma = None):
+        """A function to return attentional counts, modified by a select number of attentional focuses, for a generation.  
+        Focuses are either selected randomly from an inputted list of allowed focuses, or they are supplied directly.  The degree to which these counts are modifed
+        ('focused on') comes from the parameter gamma, which is a straighforward multiplier of the number of counts.  All meanings
+        not within the group of selected focuses have a count value corresponding to beta/M where M is total number of meanings.
+
+
+        If remove_focuses is set to true, the function removes the selected or inputted focuses from the possible focuses list
+
+        Note: likely need to add gamma as an arg, if no gamma is supplied use the self.gamma, just to allow for further control
+        """
+
+        if gamma is None:
+            gamma = self.gamma
+        
+        if supplied_focuses is None:
+            selected_focuses = np.random.choice(self.possible_focuses,size = number_focuses, replace =False)
+            self.gen_focuses.append(selected_focuses.tolist())
+        else:
+            selected_focuses = supplied_focuses
+
+        gen_counts = np.full(self.num_meanings,(self.beta/self.num_meanings))
+        for focus in selected_focuses:
+            gen_counts[focus] *=gamma
+            if remove_focuses:
+                self.possible_focuses.remove(focus)
+        
+        # print(f"Gen_counts has datatype {gen_counts.dtype}")
+        return gen_counts, selected_focuses
+
+    def recreate_agents(self, gamma = None):
         """Recreates the agents that were passed to the imported ensemble class.  Does so by using the final phi and count arrays stored 
         in the h5 file, and using the generational_focuses that were passed to the imported_ensemble class via the params.csv file.  
         This function also isntantiates the ensemble phi and counts arrays
 
 
-        NOTE: Special care will be needed later if we are ever passing a configuration with more than 1 generation in it
+        NOTE: Special care will be needed later if we are ever passing a configuration with more than 1 generation in it, as it will fail 
+        if doing so
         """
-        gen_counts = np.full(self.num_meanings,(self.beta/self.num_meanings))
+
+        if gamma is None:
+            gamma = self.gamma
+
         for i in range(len(self.gen_focuses)):
-            inst_gen_focus = self.gen_focuses[i]
-            for focus in inst_gen_focus:
-                gen_counts*= self.gamma
-        self.agents_list = []
+            inst_focus = self.gen_focuses[i]
+            number_focus = len(inst_focus)
+            gen_counts, selected_focuses = self.create_generation_counts(number_focuses=number_focus, supplied_focuses=inst_focus, gamma=gamma)
+
+            self.gen_alpha_dists.append(gen_counts)
+
+        inst_agent_list = []
 
         self.ensemble_phi = np.empty((self.num_imported_agents,self.num_signals,self.num_meanings))
         self.ensemble_counts = np.empty_like(self.ensemble_phi)
@@ -308,36 +372,22 @@ class Imported_Ensemble:
         with h5py.File(self.raw_dir/"array_data.h5", 'r') as f:
             final_phis = f['agents_phi']['agents_phi_data']
             final_counts = f['agents_counts']['agents_counts_data']
+        
             for k in range(self.num_imported_agents):
-                self.agents_list.append(self.agent_fn(passed_counts = gen_counts, generation_tag = 0))
+                inst_agent = self.agent_fn(passed_counts = gen_counts, generation_tag = self.num_gens)
+                self.agents_list.append(inst_agent)
+                inst_agent_list.append(inst_agent)
                 self.agents_list[k].phi_array = final_phis[k,:,:]
                 self.ensemble_phi[k,:,:] = final_phis[k,:,:]
                 self.agents_list[k].signal_meaning_array = final_counts[k,:,:]
                 self.ensemble_counts[k,:,:] = final_counts[k,:,:]
+            
+            f.close()
 
-    def add_agents(self, number_added):
-        """Adds new agents (of a new generation) to the agents list.  Removes corresponding new focuses from the possible focuses,
-        increases the counter for the number of agents, and updates the ensemble arrays accordingly."""
-        
-        new_generation_counts, selected_focuses = self.create_generation_counts()
+        #Now to add these new agents to the dict
+        self.gen_agent_dict[self.num_gens] = inst_agent_list
 
-        self.num_agents+=number_added
-        self.num_gens+=1
-
-        print(f"Length of agent list before is {len(self.agents_list)}") #test
-
-        for i in range(number_added):
-            self.agents_list.append(self.agent_fn(passed_counts = new_generation_counts, generation_tag = self.num_gens))
-
-        new_gen_phi = self.agents_list[-1].phi_array
-        new_gen_count = self.agents_list[-1].signal_meaning_array
-        
-        phi_block = np.repeat(new_gen_phi[None], repeats=number_added,axis = 0)
-        counts_block = np.repeat(new_gen_count[None], repeats=number_added,axis = 0)
-        self.ensemble_phi = np.concatenate([self.ensemble_phi, phi_block], axis =0)
-        self.ensemble_counts = np.concatenate([self.ensemble_counts,counts_block], axis = 0)
-
-        print(f"Length of agent list after is {len(self.agents_list)}") #test
+        self.avg_map = self.make_avg_map()
 
     def numba_warmup(self):
         test_array = np.array([0,1])
@@ -368,6 +418,46 @@ class Imported_Ensemble:
         blind_success_inner_loop(self.agents_list[0].phi_array,self.agents_list[1].phi_array,self.num_signals,self.num_meanings)
         print("Test blind success outer loop")
         blind_success_outer_loop(self.num_agents,self.ensemble_phi,self.num_signals,self.num_meanings)
+   
+    def add_agents(self, number_added):
+        """Adds new agents (of a new generation) to the agents list.  Removes corresponding new focuses from the possible focuses,
+        increases the counter for the number of agents, and updates the ensemble arrays accordingly."""
+        
+        new_generation_counts, selected_focuses = self.create_generation_counts()
+
+        self.gen_alpha_dists.append(new_generation_counts)
+
+        self.num_agents+=number_added
+        self.num_gens+=1
+
+        print(f"Length of agent list before is {len(self.agents_list)}") #test
+        inst_agent_list = []
+        for i in range(number_added):
+            inst_agent = self.agent_fn(passed_counts = new_generation_counts, generation_tag = self.num_gens)
+            self.agents_list.append(inst_agent)
+            inst_agent_list.append(inst_agent)
+
+        self.gen_agent_dict[self.num_gens] = inst_agent_list
+
+        new_gen_phi = self.agents_list[-1].phi_array
+        new_gen_count = self.agents_list[-1].signal_meaning_array
+        
+        phi_block = np.repeat(new_gen_phi[None], repeats=number_added, axis = 0)
+        counts_block = np.repeat(new_gen_count[None], repeats=number_added, axis = 0)
+
+        print(f"Shapes of ensemble phi and counts before adding are {self.ensemble_phi.shape}, and {self.ensemble_counts.shape}")
+
+        self.ensemble_phi = np.concatenate([self.ensemble_phi, phi_block], axis =0)
+        self.ensemble_counts = np.concatenate([self.ensemble_counts,counts_block], axis = 0)
+        print(f"Shapes of ensemble phi and counts after adding are {self.ensemble_phi.shape}, and {self.ensemble_counts.shape}")
+        # print(f"Length of agent list after is {len(self.agents_list)}") #test
+        self.avg_map = self.make_avg_map()
+
+    def make_avg_map(self):
+        avg_map = []
+        for i in range(len(self.gen_agent_dict.keys())):
+            avg_map.append(len(self.gen_agent_dict[i]))
+        return avg_map
 
     def one_interaction(self,agent_ids):
         """Iteration procedure for one agent to agent interaction, copied directly from the ensmble class"""
@@ -390,35 +480,21 @@ class Imported_Ensemble:
             self.ensemble_phi[i,:] = self.agents_list[i].phi_array
             self.ensemble_counts[i,:] = self.agents_list[i].signal_meaning_array
 
-    def create_generation_counts(self,number_focuses = 2):
-        """A function to return attentional counts, modified by a select number of attentional focuses, for a generation.  
-        Focuses are selected randomly from an inputted list of allowed focuses.  The degree to which these counts are modifed
-        ('focused on') comes from the parameter gamma, which is a straighforward multiplier of the number of counts.  All meanings
-        not within the group of selected focuses have a count value corresponding to beta/M where M is total number of meanings.
-        """
-        selected_focuses = np.random.choice(self.possible_focuses,size = number_focuses, replace =False)
-        self.gen_focuses.append(selected_focuses.tolist())
-        gen_counts = np.full(self.num_meanings,(self.beta/self.num_meanings))
-        for focus in selected_focuses:
-            gen_counts[focus] *=self.gamma
-            self.possible_focuses.remove(focus)
-        # print(f"Gen_counts has datatype {gen_counts.dtype}")
-        return gen_counts, selected_focuses
-
     def measure_blind_success(self):
         """Sum over all pairs and then subtract the diagonal elements"""
         p_s = blind_success_outer_loop(self.num_agents,self.ensemble_phi,self.num_signals,self.num_meanings)
         return p_s
 
-    def generate_initial_h5_file(self,save_gen_specific = True):
+    def generate_initial_h5_file(self):
             """Generates the h5_file used to store data as the experiment runs, should only be 
             used after the initial ensemble arrays have been calculated"""
             save_dir = self.output_dir/"raw"
             save_dir.mkdir(parents = True, exist_ok = True)
             self.h5_file = h5py.File(name =save_dir/"array_data.h5", mode = 'w')
-            
+
+            """Ensemble_Phi Data"""
             self.h5_phi_group = self.h5_file.create_group(name = 'Phi')
-            self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (1, self.num_signals, self.num_meanings), 
+            self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (1,self.num_signals, self.num_meanings), 
                                                         maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
             self.h5_phi_dataset.attrs['description'] = 'Ensemble phi arrays over time'
             self.h5_phi_dataset.attrs['num_signals'] = self.num_signals
@@ -427,6 +503,31 @@ class Imported_Ensemble:
             self.h5_phi_dataset[0,:,:] = self.ensemble_phi.mean(axis =0)
 
 
+            """Generation specific phi data"""
+            self.h5_phi_gens_dataset = self.h5_phi_group.create_dataset(name = 'phi_gens_dataset', shape = (1,self.num_gens+1,self.num_signals, self.num_meanings), 
+                                                        maxshape = (None,None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+            #Want it to be none in both the first and second generation to allow in simulation updates later on
+            self.h5_phi_gens_dataset.attrs['description'] = 'Generation specific average phi arrays over time'
+            self.h5_phi_gens_dataset.attrs['num_signals'] = self.num_signals
+            self.h5_phi_gens_dataset.attrs['num_meanings'] = self.num_meanings
+            self.h5_phi_gens_dataset.attrs['num_gens'] = self.num_gens
+
+
+            # print(f"Starting h5_phi_gens values")
+            # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
+            # print(f"Avg map is {self.avg_map}")
+            start_idx = 0
+            for i in range(self.num_gens+1):
+                # print(i)
+                end_idx = start_idx+self.avg_map[i]
+                gens_phi = self.ensemble_phi[start_idx:end_idx,:,:]
+                # print(f"Shape of gens_phi is {gens_phi.shape}")
+
+                self.h5_phi_gens_dataset[0,i,:,:] = gens_phi.mean(axis =0)
+                start_idx = end_idx
+
+            
+            """Ensemble_n(S|M) Data"""
             self.h5_signal_meanings_group = self.h5_file.create_group(name = 'signal_meaning')
             self.h5_signal_meanings_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meanings_dataset', shape = (1, self.num_signals, self.num_meanings), 
                                                         maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
@@ -435,6 +536,30 @@ class Imported_Ensemble:
             self.h5_signal_meanings_dataset.attrs['num_meanings'] = self.num_meanings
 
             self.h5_signal_meanings_dataset[0,:,:] = self.ensemble_counts.mean(axis =0)
+
+
+            """Generation specific counts data, copying same overall structure as the gens phi"""
+            self.h5_signal_meanings_gens_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meanings_gens_dataset', 
+                shape = (1,self.num_gens+1,self.num_signals, self.num_meanings),maxshape = (None,None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+            #Want it to be none in both the first and second generation to allow in simulation updates later on
+            self.h5_signal_meanings_gens_dataset.attrs['description'] = 'Generation specific average signal_meanings arrays over time'
+            self.h5_signal_meanings_gens_dataset.attrs['num_signals'] = self.num_signals
+            self.h5_signal_meanings_gens_dataset.attrs['num_meanings'] = self.num_meanings
+            self.h5_signal_meanings_gens_dataset.attrs['num_gens'] = self.num_gens
+
+
+            # print(f"Starting h5_signal_meanings_gens values")
+            # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
+            # print(f"Avg map is {self.avg_map}")
+            start_idx = 0
+            for i in range(self.num_gens+1):
+                print(i)
+                end_idx = start_idx+self.avg_map[i]
+                gens_signal_meanings = self.ensemble_counts[start_idx:end_idx,:,:]
+                print(f"Shape of gens_signal_meanings is {gens_signal_meanings.shape}")
+
+                self.h5_signal_meanings_gens_dataset[0,i,:,:] = gens_signal_meanings.mean(axis =0)
+                start_idx = end_idx
 
             """If self.export_agents set to true, we need an array to save the final phi and count arrays from all agents """
             if self.export_agents:
@@ -452,11 +577,6 @@ class Imported_Ensemble:
                 self.h5_agents_counts_data.attrs['description'] = "Each agent in the simulation's final phi array"
                 self.h5_agents_counts_data.attrs['num_signals'] = self.num_signals
                 self.h5_agents_counts_data.attrs['num_meanings'] = self.num_meanings
-
-            if save_gen_specific:
-                """If save_gen_specific is set to be true, we also store ensemble phi and counts for each individual generation
-                to be plotted and compared with the ensemble"""
-                
 
     def save_to_file(self, iteration: int = None):
         """Save the experimental data to a file as it is calculated/experiment is performed"""
@@ -490,10 +610,24 @@ class Imported_Ensemble:
 
             self.h5_phi_dataset.resize(current_phi_iter_val+1,axis=0)
             self.h5_signal_meanings_dataset.resize(current_counts_iter_val+1,axis=0)
+
+            self.h5_phi_gens_dataset.resize(current_phi_iter_val+1,axis = 0)
+            self.h5_signal_meanings_gens_dataset.resize(current_counts_iter_val+1,axis=0)
+
             self.h5_phi_dataset[current_phi_iter_val,:,:] = self.ensemble_phi.mean(axis = 0)
             self.h5_signal_meanings_dataset[current_counts_iter_val,:,:] = self.ensemble_counts.mean(axis = 0)
 
-    def save_params(self,iterations,convergence):
+            start_idx = 0
+            for i in range(self.num_gens+1):
+                end_idx = self.avg_map[i] +start_idx
+                ensemble_phi = self.ensemble_phi[start_idx:end_idx,:,:]
+                ensemble_counts = self.ensemble_counts[start_idx:end_idx,:,:]
+                self.h5_phi_gens_dataset[current_phi_iter_val,i,:,:] = ensemble_phi.mean(axis = 0)
+                self.h5_signal_meanings_gens_dataset[current_counts_iter_val,i,:,:] = ensemble_counts.mean(axis = 0)
+                start_idx = end_idx
+
+    
+    def save_params(self,iterations,convergence, avg_map):
         params_dict = {'num_meanings': self.num_meanings,
                        'num_signals': self.num_signals,
                        'num_agents': self.num_agents,
@@ -507,7 +641,10 @@ class Imported_Ensemble:
                         'iterations':iterations,
                         'Steady_State':convergence,
                         'number_of_gens':self.num_gens,
-                        'imported_file': self.param_dir}
+                        'imported_file': self.param_dir,
+                        'avg_map': avg_map,
+                        'gen_alphas': self.gen_alpha_dists
+        }
         params_df = pd.DataFrame([params_dict])
         params_file = self.output_dir / "simulation_parameters.csv"
         params_df.to_csv(params_file, index=False)
@@ -544,7 +681,10 @@ class Imported_Ensemble:
 
                 self.save_to_file(iteration= i) 
 
-        self.save_params(iterations,converged)
+        """Need to make the guide for averaging the ensemble arrays which then gets passed to the plotter"""
+        
+
+        self.save_params(iterations,converged,self.avg_map)
         
 
 
@@ -561,7 +701,7 @@ if __name__ =="__main__":
     parser.add_argument('--Alpha', type = float, help="Determines the value of parameter alpha", default=0.1)
     parser.add_argument('--lambda_val', type = float, help="Determines the value of lambda, or the forgetting rate of the models", default=0.01)
     parser.add_argument('--alignment', type = float, help="Determines the alignment between models", default=1.0)
-    parser.add_argument('--iterations', type=float, help = "Determines how many millions of iterations to run the code for", default = 4)
+    parser.add_argument('--iterations', type=float, help = "Determines how many millions of iterations to run the code for", default = 4.0)
     parser.add_argument('--OutputDir', type = str, help = 'Determines the file output of saved plots, data, etc', 
                             default =str(Path.home()/"Downloads"/"MPhys/Code_Runs"))
     parser.add_argument('--Filename', type = str, help='Determines the file to save data to', default= 'Unsorted')
@@ -590,12 +730,13 @@ if __name__ =="__main__":
 
     agent_func = lambda **kwargs: Agent(meanings,signals,args.lambda_val,args.Alpha,args.Beta,args.NumMeanings,args.NumSignals,**kwargs)
 
-    read_data_ensemble= Imported_Ensemble(input_dir, agent_func, output_directory)
+    read_data_ensemble= Imported_Ensemble(input_dir, agent_func, output_directory, new_gamma=args.gamma)
 
     # print(len(read_data_ensemble.agents_list))
-    # read_data_ensemble.add_agents(number_added=3)
     # print(read_data_ensemble.gen_focuses)
     # print(read_data_ensemble.possible_focuses)
     read_data_ensemble.update_ensemble_arrays()
+    read_data_ensemble.add_agents(number_added=3)
+    print(f"Ensemble alphas are {read_data_ensemble.gen_alpha_dists}")
     read_data_ensemble.training_loop(total_iterations)
     
