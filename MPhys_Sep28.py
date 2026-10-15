@@ -70,13 +70,13 @@ def update_signal_meaning(counts_array, lambda_val, meaning_index, signal_index,
     
     
 @njit(parallel = True)
-def create_phi_tensor(num_agents, agent_list,num_signals,num_meanings):
+def create_phi_tensor(num_agents, agents_list,num_signals,num_meanings):
     """Compiles all the phi arrays into a singular tensor, to make calculating gain values easier"""
     phi_tensor = np.empty((num_agents,num_signals,num_meanings))
     for i in range(num_agents):
         for j in prange(num_signals):
             for k in prange(num_meanings):
-                phi_tensor[i,j,k] = agent_list[i].phi_array[j,k]
+                phi_tensor[i,j,k] = agents_list[i].phi_array[j,k]
 
 @njit
 def blind_success_inner_loop(agenti_phi,agentj_phi,num_signals,num_meanings):
@@ -192,7 +192,7 @@ class Agent:
     certainty into it at this moment
     
     """
-    def __init__(self,meanings,signals, lambda_val, alpha, beta,num_meanings, num_signals,passed_counts = None, generation_tag =0):
+    def __init__(self,meanings,signals, lambda_val, alpha, beta,num_meanings, num_signals,passed_counts = None, generation_tag =None):
         self.num_meanings = num_meanings
         self.num_signals = num_signals
         
@@ -249,89 +249,6 @@ class Agent:
         new_phi_row = update_phi(self.signal_meaning_array,self.Alpha,self.Alpha_s,signal_idx,self.num_meanings)
         self.phi_array[signal_idx,:] = new_phi_row
         
-
-
-class Imported_Ensemble:
-    """A class very similar to the base ensmeble class, except for the fact that it allows for the importing of already established agent networks.
-    This allows us to skip tedious, uninteresting monogenerational runs to baseline, speeding up computation time significantly.  Additionally, this 
-     creates the ability to control our studies, as all increased generational trials can be done on the same configuration. """
-    def __init__(self, input_dir,agent_fn, generation_overlap = False):
-        self.param_dir = Path(input_dir)
-        self.raw_dir = Path(input_dir)/"raw"
-        self.agent_fn = agent_fn
-        self.read_param_file()
-        print(f"number of different generation focus sets is {len(self.imported_gens_focuses)}, the amount of focuses per each gen is{len(self.imported_gens_focuses[0])}")
-        
-        self.recreate_agents()
-
-
-
-        pass    
-
-    def read_param_file(self):
-        """Reads the inputted parameter.csv file and updates/records the relevant ensemble parameter values accordingly"""
-        params_df = pd.read_csv(self.param_dir/"simulation_parameters.csv")
-        self.num_meanings = params_df['num_meanings'][0]
-        # print(self.num_meanings)
-        self.num_signals = params_df['num_signals'][0]
-        self.num_imported_agents = params_df['num_agents'][0]
-        self.imported_gens_lambda = params_df['lambda'][0]
-        self.beta = params_df['beta'][0]
-        self.gamma = params_df['gamma'][0]
-        self.imported_gens_focuses = params_df['generation_focuses'].apply(ast.literal_eval)[0]
-        #Need the extra handling to convert the csv's string back into an actual python list
-        self.certainty = params_df['certainty'][0]
-
-        # print(self.num_signals,self.num_imported_agents,self.imported_gens_lambda,self.beta,self.gamma,self.imported_gens_focuses,self.certainty)
-
-    def recreate_agents(self):
-        """Recreates the agents that were passed to the imported ensemble class.  Does so by using the final phi and count arrays stored 
-        in the h5 file, and using the generational_focuses that were passed to the imported_ensemble class via the params.csv file.  
-        
-        NOTE: Special care will be needed later if we are ever passing a configuration with more than 1 generation in it
-        """
-        gen_counts = np.full(self.num_meanings,(self.beta/self.num_meanings))
-        for i in range(len(self.imported_gens_focuses)):
-            inst_gen_focus = self.imported_gens_focuses[i]
-            for focus in inst_gen_focus:
-                gen_counts*= self.gamma
-        self.agents_list = []
-
-        with h5py.File(self.raw_dir/"array_data.h5", 'r') as f:
-            final_phis = f['agents_phi']['agents_phi_data']
-            final_counts = f['agents_counts']['agents_counts_data']
-            for k in range(self.num_imported_agents):
-                self.agents_list.append(self.agent_fn(passed_counts = gen_counts))
-                self.agents_list[k].phi_array = final_phis[k,:,:]
-                self.agents_list[k].signal_meaning_array = final_counts[k,:,:]
-
-    def one_interaction(self):
-        """Iteration procedure for one agent to agent interaction, copied directly from the ensmble class"""
-        selected_agents = np.random.choice(self.agent_ids,size=2, replace=False)
-        signaller_agent = self.agent_list[selected_agents[0]]
-        receiver_agent = self.agent_list[selected_agents[1]]
-        # print("Agents selected")
-
-
-        selcted_signal_idx,inst_rho = signaller_agent.select_signal_numba()
-        # print("Signal and rho sent")
-        # print(selcted_signal_idx,inst_rho)
-
-        nu_idx = receiver_agent.receive_signal_numba(selcted_signal_idx,inst_rho,self.A)
-        # print("Signal received")
-        # print(nu_idx)
-
-        receiver_agent.update_counts(nu_idx,selcted_signal_idx)
-        # print("counts updated")
-
-    def update_ensemble_arrays(self):
-        """Numba cannot be passed an agent_type at all, as such, we need to create tensors for the ensemble average values,
-        i.e., values we would otherwise obtain in a numba function from the objects passed."""
-        for i in range(self.number_agents):
-            self.ensemble_phi[i,:] = self.agent_list[i].phi_array
-            self.ensemble_counts[i,:] = self.agent_list[i].signal_meaning_array
-
-
         
 
 
@@ -360,7 +277,7 @@ class Ensemble:
             self.gen_probs = generation_probs
             generation_counts,discard= self.create_generation_counts(beta=beta,gamma=gamma,possible_focuses=self.possible_focuses,number_focuses=number_focuses)
 
-            self.agent_list = [agent_fn(passed_counts = generation_counts) for _ in range(num_agents)]
+            self.agents_list = [agent_fn(passed_counts = generation_counts) for _ in range(num_agents)]
 
 
         else:
@@ -368,7 +285,7 @@ class Ensemble:
             self.number_of_gens = 0
             self.gamma = 'N/A'
             self.gen_probs = 'N/A'
-            self.agent_list = [agent_fn() for _ in range(num_agents)]
+            self.agents_list = [agent_fn() for _ in range(num_agents)]
         #Creates the initial list of agents
         self.ensemble_phi = np.empty((self.number_agents,self.num_signals,self.num_meanings))
         self.ensemble_counts = np.empty_like(self.ensemble_phi)
@@ -397,14 +314,14 @@ class Ensemble:
         """Numba cannot be passed an agent_type at all, as such, we need to create tensors for the ensemble average values,
         i.e., values we would otherwise obtain in a numba function from the objects passed."""
         for i in range(self.number_agents):
-            self.ensemble_phi[i,:] = self.agent_list[i].phi_array
-            self.ensemble_counts[i,:] = self.agent_list[i].signal_meaning_array
+            self.ensemble_phi[i,:] = self.agents_list[i].phi_array
+            self.ensemble_counts[i,:] = self.agents_list[i].signal_meaning_array
     
     def numba_warmup(self):
         test_array = np.array([0,1])
 
         print("Initialising Numba Functions")
-        selected_agent = self.agent_list[0]
+        selected_agent = self.agents_list[0]
         print("Testing delta")
         delta(1,1)
         print("Testing update_phi")
@@ -431,17 +348,17 @@ class Ensemble:
                                      selected_agent.num_meanings)
         
         # print("Test create_phi_tensor")
-        # create_phi_tensor(1,self.agent_list,self.num_signals,self.num_meanings)
+        # create_phi_tensor(1,self.agents_list,self.num_signals,self.num_meanings)
         print("Test blind success inner loop")
-        blind_success_inner_loop(self.agent_list[0].phi_array,self.agent_list[1].phi_array,self.num_signals,self.num_meanings)
+        blind_success_inner_loop(self.agents_list[0].phi_array,self.agents_list[1].phi_array,self.num_signals,self.num_meanings)
         print("Test blind success outer loop")
         blind_success_outer_loop(self.number_agents,self.ensemble_phi,self.num_signals,self.num_meanings)
 
     def one_interaction(self):
         """Iteration procedure for one agent to agent interaction"""
         selected_agents = np.random.choice(self.agent_ids,size=2, replace=False)
-        signaller_agent = self.agent_list[selected_agents[0]]
-        receiver_agent = self.agent_list[selected_agents[1]]
+        signaller_agent = self.agents_list[selected_agents[0]]
+        receiver_agent = self.agents_list[selected_agents[1]]
         # print("Agents selected")
 
 
@@ -500,14 +417,14 @@ class Ensemble:
         params_dict = {'num_meanings': self.num_meanings,
                        'num_signals': self.num_signals,
                        'num_agents': self.number_agents,
-                       'lambda':self.agent_list[0].lambda_val,
-                        'alpha': self.agent_list[0].Alpha,
-                        'beta': self.agent_list[0].beta,
+                       'lambda':self.agents_list[0].lambda_val,
+                        'alpha': self.agents_list[0].Alpha,
+                        'beta': self.agents_list[0].beta,
                         'gamma':self.gamma,
                         'generation_probs':self.gen_probs,
                         'generation_focuses':self.generation_focuses,
                         'alignment':self.A,
-                        'certainty':self.agent_list[0].certainty,
+                        'certainty':self.agents_list[0].certainty,
                         'iterations':iterations,
                         'Steady_State':convergence,
                         'number_of_gens':self.number_of_gens}
@@ -526,10 +443,10 @@ class Ensemble:
 
 
         meta_data = {
-            "num_agents": len(self.agent_list),
+            "num_agents": len(self.agents_list),
             "num_signals": self.num_signals,
             "num_meanings": self.num_meanings,
-            "lambda_val": self.agent_list[0].lambda_val
+            "lambda_val": self.agents_list[0].lambda_val
         }
         with open(save_dir/"metadata.json","w") as f:
             json.dump(meta_data,f,indent=4)
@@ -558,8 +475,8 @@ class Ensemble:
             agents_counts_group = f['agents_counts']
             agents_counts_data = agents_counts_group['agents_counts_data']
             for i in range(self.number_agents):
-                agents_phi_data[i,:,:] = self.agent_list[i].phi_array
-                agents_counts_data[i,:,:] = self.agent_list[i].signal_meaning_array
+                agents_phi_data[i,:,:] = self.agents_list[i].phi_array
+                agents_counts_data[i,:,:] = self.agents_list[i].signal_meaning_array
 
             f.close()
         print("Agent data saved")
@@ -673,12 +590,6 @@ if __name__ =="__main__":
     #We add the **kwargs so that we can pass the function a predetermined rho if necessary
 
     Test_ensemble = Ensemble(args.NumAgents,agent_func,args.alignment,args.NumSignals,args.NumMeanings,
-                             output_directory,args.Generations,generation_probs=gen_probs,number_focuses=args.Focuses)
+                             output_directory,args.Generations,generation_probs=gen_probs,number_focuses=args.Focuses, gamma = args.gamma)
     Test_ensemble.training_loop(iterations=total_iterations)
     
-    # input_dir = str(Path.home()/"Downloads"/"MPhys/Code_Runs/Oct8th_Agent_Saving_Test")
-    # read_data_testing = Imported_Ensemble(input_dir, agent_func)
-    # # read_data_testing.read_param_file()
-    # # read_data_testing.recreate_agents
-
-    # print(len(read_data_testing.agents_list))
