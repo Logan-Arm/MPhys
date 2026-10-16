@@ -284,12 +284,13 @@ class Imported_Ensemble:
         else:
             print(f"No gamma supplied")
             self.recreate_agents()
-        # self.recreate_agents()
 
         # print(f"Gen alpha distribution is {self.gen_alpha_dists}")
         self.num_agents = len(self.agents_list)
 
         self.numba_warmup()
+
+
 
     def read_param_file(self):
         """Reads the inputted parameter.csv file and updates/records the relevant ensemble parameter values accordingly"""
@@ -362,7 +363,7 @@ class Imported_Ensemble:
             number_focus = len(inst_focus)
             gen_counts, selected_focuses = self.create_generation_counts(number_focuses=number_focus, supplied_focuses=inst_focus, gamma=gamma)
 
-            self.gen_alpha_dists.append(gen_counts)
+            self.gen_alpha_dists.append(gen_counts.tolist())
 
         inst_agent_list = []
 
@@ -372,6 +373,7 @@ class Imported_Ensemble:
         with h5py.File(self.raw_dir/"array_data.h5", 'r') as f:
             final_phis = f['agents_phi']['agents_phi_data']
             final_counts = f['agents_counts']['agents_counts_data']
+            # print(f"Final counts is {final_counts}")
         
             for k in range(self.num_imported_agents):
                 inst_agent = self.agent_fn(passed_counts = gen_counts, generation_tag = self.num_gens)
@@ -380,6 +382,7 @@ class Imported_Ensemble:
                 self.agents_list[k].phi_array = final_phis[k,:,:]
                 self.ensemble_phi[k,:,:] = final_phis[k,:,:]
                 self.agents_list[k].signal_meaning_array = final_counts[k,:,:]
+                # print(final_counts[k,:,:])
                 self.ensemble_counts[k,:,:] = final_counts[k,:,:]
             
             f.close()
@@ -425,12 +428,12 @@ class Imported_Ensemble:
         
         new_generation_counts, selected_focuses = self.create_generation_counts()
 
-        self.gen_alpha_dists.append(new_generation_counts)
+        self.gen_alpha_dists.append(new_generation_counts.tolist())
 
         self.num_agents+=number_added
         self.num_gens+=1
 
-        print(f"Length of agent list before is {len(self.agents_list)}") #test
+        # print(f"Length of agent list before is {len(self.agents_list)}") #test
         inst_agent_list = []
         for i in range(number_added):
             inst_agent = self.agent_fn(passed_counts = new_generation_counts, generation_tag = self.num_gens)
@@ -445,11 +448,11 @@ class Imported_Ensemble:
         phi_block = np.repeat(new_gen_phi[None], repeats=number_added, axis = 0)
         counts_block = np.repeat(new_gen_count[None], repeats=number_added, axis = 0)
 
-        print(f"Shapes of ensemble phi and counts before adding are {self.ensemble_phi.shape}, and {self.ensemble_counts.shape}")
+        # print(f"Shapes of ensemble phi and counts before adding are {self.ensemble_phi.shape}, and {self.ensemble_counts.shape}")
 
         self.ensemble_phi = np.concatenate([self.ensemble_phi, phi_block], axis =0)
         self.ensemble_counts = np.concatenate([self.ensemble_counts,counts_block], axis = 0)
-        print(f"Shapes of ensemble phi and counts after adding are {self.ensemble_phi.shape}, and {self.ensemble_counts.shape}")
+        # print(f"Shapes of ensemble phi and counts after adding are {self.ensemble_phi.shape}, and {self.ensemble_counts.shape}")
         # print(f"Length of agent list after is {len(self.agents_list)}") #test
         self.avg_map = self.make_avg_map()
 
@@ -494,8 +497,8 @@ class Imported_Ensemble:
 
             """Ensemble_Phi Data"""
             self.h5_phi_group = self.h5_file.create_group(name = 'Phi')
-            self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (1,self.num_signals, self.num_meanings), 
-                                                        maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+            self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (self.num_measurements,self.num_signals, self.num_meanings), 
+                                                        dtype = np.float64, chunks = True)
             self.h5_phi_dataset.attrs['description'] = 'Ensemble phi arrays over time'
             self.h5_phi_dataset.attrs['num_signals'] = self.num_signals
             self.h5_phi_dataset.attrs['num_meanings'] = self.num_meanings
@@ -504,8 +507,9 @@ class Imported_Ensemble:
 
 
             """Generation specific phi data"""
-            self.h5_phi_gens_dataset = self.h5_phi_group.create_dataset(name = 'phi_gens_dataset', shape = (1,self.num_gens+1,self.num_signals, self.num_meanings), 
-                                                        maxshape = (None,None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+            self.h5_phi_gens_dataset = self.h5_phi_group.create_dataset(name = 'phi_gens_dataset', shape = (self.num_measurements,self.num_gens+1,self.num_signals,
+                        self.num_meanings),maxshape = (self.num_measurements,None, self.num_signals, self.num_meanings),
+                        dtype = np.float64, chunks = True)
             #Want it to be none in both the first and second generation to allow in simulation updates later on
             self.h5_phi_gens_dataset.attrs['description'] = 'Generation specific average phi arrays over time'
             self.h5_phi_gens_dataset.attrs['num_signals'] = self.num_signals
@@ -529,8 +533,8 @@ class Imported_Ensemble:
             
             """Ensemble_n(S|M) Data"""
             self.h5_signal_meanings_group = self.h5_file.create_group(name = 'signal_meaning')
-            self.h5_signal_meanings_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meanings_dataset', shape = (1, self.num_signals, self.num_meanings), 
-                                                        maxshape = (None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+            self.h5_signal_meanings_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meanings_dataset', 
+                        shape = (self.num_measurements, self.num_signals, self.num_meanings), dtype = np.float64, chunks = True)
             self.h5_signal_meanings_dataset.attrs['description'] = "Ensemble signal meaning count array over time "
             self.h5_signal_meanings_dataset.attrs['num_signals'] = self.num_signals
             self.h5_signal_meanings_dataset.attrs['num_meanings'] = self.num_meanings
@@ -540,7 +544,8 @@ class Imported_Ensemble:
 
             """Generation specific counts data, copying same overall structure as the gens phi"""
             self.h5_signal_meanings_gens_dataset = self.h5_signal_meanings_group.create_dataset(name = 'signal_meanings_gens_dataset', 
-                shape = (1,self.num_gens+1,self.num_signals, self.num_meanings),maxshape = (None,None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
+                shape = (self.num_measurements,self.num_gens+1,self.num_signals, self.num_meanings),
+                maxshape = (self.num_measurements,None, self.num_signals, self.num_meanings),dtype = np.float64, chunks = True)
             #Want it to be none in both the first and second generation to allow in simulation updates later on
             self.h5_signal_meanings_gens_dataset.attrs['description'] = 'Generation specific average signal_meanings arrays over time'
             self.h5_signal_meanings_gens_dataset.attrs['num_signals'] = self.num_signals
@@ -578,7 +583,7 @@ class Imported_Ensemble:
                 self.h5_agents_counts_data.attrs['num_signals'] = self.num_signals
                 self.h5_agents_counts_data.attrs['num_meanings'] = self.num_meanings
 
-    def save_to_file(self, iteration: int = None):
+    def save_to_file(self,idx_iter):
         """Save the experimental data to a file as it is calculated/experiment is performed"""
         save_dir = self.output_dir/"raw"
         save_dir.mkdir(parents = True, exist_ok = True)
@@ -603,27 +608,29 @@ class Imported_Ensemble:
             pd.DataFrame({"epoch": self.gain_epochs, "gain": self.gain_values}).to_csv(save_dir / "gain_values.csv",
                                                                                         index=False)
 
-        if iteration is not None:
+        if idx_iter is not None:
             """If iteration is not none, we append the data we found to the h5py file we initialised earlier"""
             current_phi_iter_val = self.h5_phi_dataset.shape[0]
             current_counts_iter_val =self.h5_signal_meanings_dataset.shape[0]
 
-            self.h5_phi_dataset.resize(current_phi_iter_val+1,axis=0)
-            self.h5_signal_meanings_dataset.resize(current_counts_iter_val+1,axis=0)
 
-            self.h5_phi_gens_dataset.resize(current_phi_iter_val+1,axis = 0)
-            self.h5_signal_meanings_gens_dataset.resize(current_counts_iter_val+1,axis=0)
+            # print(f"Saving to file, saving ensemble data")
+            # self.h5_phi_dataset.resize(current_phi_iter_val+1,axis=0)
+            # self.h5_signal_meanings_dataset.resize(current_counts_iter_val+1,axis=0)
 
-            self.h5_phi_dataset[current_phi_iter_val,:,:] = self.ensemble_phi.mean(axis = 0)
-            self.h5_signal_meanings_dataset[current_counts_iter_val,:,:] = self.ensemble_counts.mean(axis = 0)
+            # self.h5_phi_gens_dataset.resize(current_phi_iter_val+1,axis = 0)
+            # self.h5_signal_meanings_gens_dataset.resize(current_counts_iter_val+1,axis=0)
+
+            self.h5_phi_dataset[idx_iter,:,:] = self.ensemble_phi.mean(axis = 0)
+            self.h5_signal_meanings_dataset[idx_iter,:,:] = self.ensemble_counts.mean(axis = 0)
 
             start_idx = 0
             for i in range(self.num_gens+1):
                 end_idx = self.avg_map[i] +start_idx
                 ensemble_phi = self.ensemble_phi[start_idx:end_idx,:,:]
                 ensemble_counts = self.ensemble_counts[start_idx:end_idx,:,:]
-                self.h5_phi_gens_dataset[current_phi_iter_val,i,:,:] = ensemble_phi.mean(axis = 0)
-                self.h5_signal_meanings_gens_dataset[current_counts_iter_val,i,:,:] = ensemble_counts.mean(axis = 0)
+                self.h5_phi_gens_dataset[idx_iter,i,:,:] = ensemble_phi.mean(axis = 0)
+                self.h5_signal_meanings_gens_dataset[idx_iter,i,:,:] = ensemble_counts.mean(axis = 0)
                 start_idx = end_idx
 
     
@@ -650,7 +657,15 @@ class Imported_Ensemble:
         params_df.to_csv(params_file, index=False)
         print(f"Saved simulation parameters to {params_file}")        
 
-    def training_loop(self,iterations):
+    def print_lambdas(self):
+        """Debug function to print all the lambda vals"""
+        for i in range(self.num_agents):
+            print(f"Lambda val for agent {i} is {self.agents_list[i].lambda_val}")
+
+    def debug_counts(self):
+        """Debug the count arrays"""
+
+    def training_loop(self):
 
         self.update_ensemble_arrays()
         #Initialise the files to save the data in
@@ -659,17 +674,13 @@ class Imported_Ensemble:
         self.gain_values = []
         self.gain_epochs = []
         converged = False
-        for i in range(iterations):
+        idx_iter = 1
+        for i in range(self.iterations):
             self.one_interaction(agent_ids)
-            if ((i>0) and (i%100000 ==0)):
+            if ((i>0) and (i%self.time_resolution ==0)):
                 print(f"On iteration {i}")
                 self.update_ensemble_arrays()
 
-                if i== 2500000:
-                    self.test_phi_h5 = self.ensemble_phi.mean(axis = 0)
-                    self.test_counts_h5 = self.ensemble_counts.mean(axis = 0)
-                    self.h5_test_i = i//100000
-                    
                 p_s = self.measure_blind_success()
                 gain = ((self.num_meanings*p_s) -1)/(self.num_signals-1)
                 if (gain>=0.80) and (converged ==False):
@@ -679,12 +690,15 @@ class Imported_Ensemble:
                 self.gain_values.append(gain)
                 self.gain_epochs.append(i)
 
-                self.save_to_file(iteration= i) 
+                
+                self.save_to_file(idx_iter=idx_iter) 
+                idx_iter+=1
+
 
         """Need to make the guide for averaging the ensemble arrays which then gets passed to the plotter"""
         
 
-        self.save_params(iterations,converged,self.avg_map)
+        self.save_params(self.iterations,converged,self.avg_map)
         
 
 
@@ -713,6 +727,7 @@ if __name__ =="__main__":
     parser.add_argument('--gamma', type = int, help="Determines the parameter gamma, which controls \
                         how much the generational focus is multiplied by", default=2)
     parser.add_argument('--Focuses', type = int, help="Determines how many focuses are in each generation", default=2)
+    
 
     args = parser.parse_args()
 
@@ -730,13 +745,27 @@ if __name__ =="__main__":
 
     agent_func = lambda **kwargs: Agent(meanings,signals,args.lambda_val,args.Alpha,args.Beta,args.NumMeanings,args.NumSignals,**kwargs)
 
-    read_data_ensemble= Imported_Ensemble(input_dir, agent_func, output_directory, new_gamma=args.gamma)
+    read_data_ensemble= Imported_Ensemble(input_dir, agent_func, output_directory, iterations=total_iterations,new_gamma=args.gamma)
 
     # print(len(read_data_ensemble.agents_list))
     # print(read_data_ensemble.gen_focuses)
     # print(read_data_ensemble.possible_focuses)
-    read_data_ensemble.update_ensemble_arrays()
+    # read_data_ensemble.update_ensemble_arrays()
+
     read_data_ensemble.add_agents(number_added=3)
-    print(f"Ensemble alphas are {read_data_ensemble.gen_alpha_dists}")
-    read_data_ensemble.training_loop(total_iterations)
-    
+
+    read_data_ensemble.update_ensemble_arrays()
+    mean =read_data_ensemble.ensemble_counts.mean(axis = 0) 
+    # print(mean)
+    # print(mean.shape)
+    print(f"mean max is {np.max(mean)}, mean min is {np.min(mean)}")
+    # print(f"Ensemble alphas are {read_data_ensemble.gen_alpha_dists}")
+    read_data_ensemble.training_loop()
+    # read_data_ensemble.print_lambdas()
+
+
+
+    mean =read_data_ensemble.ensemble_counts.mean(axis = 0) 
+        # print(mean)
+        # print(mean.shape)
+    print(f"mean max is {np.max(mean)}, mean min is {np.min(mean)}")
