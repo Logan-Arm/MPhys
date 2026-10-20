@@ -144,15 +144,20 @@ def select_signal_integers_njit(alpha_dist, phi_array,meanings_integers,signals_
 
 @njit
 def receive_signal_integers_njit(signal_idx,A,passed_rho_dist,alpha_dist,phi_array,meanings_integers,num_meanings):
-    """A numba version of the signal receiving and interpretation process"""
-    rho_roll = np.random.rand()
-    if rho_roll<=A:
-        rho_dist = passed_rho_dist
-    else:
-        rho_dist = np.random.dirichlet(alpha=alpha_dist)
+    """A numba version of the signal receiving and interpretation process, confined to one generation"""
+    # rho_roll = np.random.rand()
+    # if rho_roll<=A:
+    #     rho_dist = passed_rho_dist
+    # else:
+    #     rho_dist = np.random.dirichlet(alpha=alpha_dist)
+
+    """Above is commented out as we have not yet begun experimenting with different inter-agent alignment"""
+
     # print("Rho dist")
     # print(rho_dist)
     
+
+    rho_dist = passed_rho_dist
     phi_s_mu = phi_array[int(signal_idx),:]
     # print("phi_s_mu")
     # print(phi_s_mu)
@@ -171,6 +176,27 @@ def receive_signal_integers_njit(signal_idx,A,passed_rho_dist,alpha_dist,phi_arr
     nu_idx = numba_random_choice(meanings_integers,posterior_dist)
     return nu_idx
 
+@njit
+def receive_signal_intergers_intergen_njit(signal_idx,passed_alpha_dist,phi_array,meanings_integers,num_meanings):
+    """Numba function to model the dynamics of signal interpretation between two generations"""
+    rho_dist = np.random.dirichlet(alpha=passed_alpha_dist)
+    phi_s_mu = phi_array[int(signal_idx),:]
+    # print("phi_s_mu")
+    # print(phi_s_mu)
+    denom = (phi_s_mu*rho_dist).sum()
+    # print("Denominator")
+    # print(denom)
+    posterior_dist = np.zeros(num_meanings, dtype=np.float64)
+    for j in range(num_meanings):
+        # inst_val = (phi_s_mu[j]*rho_dist[j])/denom
+        # print("inst_val")
+        # print(inst_val)
+        posterior_dist[j] = ((phi_s_mu[j]*rho_dist[j])/denom)
+
+    # print("Posterior Chain")
+    # print(posterior_dist)
+    nu_idx = numba_random_choice(meanings_integers,posterior_dist)
+    return nu_idx
 
 
 class Agent:
@@ -229,6 +255,11 @@ class Agent:
     def receive_signal_numba(self,signal_idx,rho_dist,A):
         nu_idx = receive_signal_integers_njit(signal_idx,A,rho_dist,self.alpha_dist,self.phi_array,self.meanings_integers,self.num_meanings)
         return nu_idx
+
+    def receive_signal_intergen(self,signal_idx,intergen_alpha):
+        nu_idx = receive_signal_intergers_intergen_njit(signal_idx,intergen_alpha,self.phi_array,self.meanings_integers,self.num_meanings)
+        return nu_idx
+    
     def update_counts(self, nu_idx, signal_idx):
         """Update rule is that all values in the signal_meaning_array decay by (1-lambda)*current_value, 
         with the exception of the actual signal, which while it does decay, is also incremented by 1. """
@@ -246,7 +277,8 @@ class Imported_Ensemble:
     """A class very similar to the base ensmeble class, except for the fact that it allows for the importing of already established agent networks.
     This allows us to skip tedious, uninteresting monogenerational runs to baseline, speeding up computation time significantly.  Additionally, this 
      creates the ability to control our studies, as all increased generational trials can be done on the same configuration. """
-    def __init__(self, read_dir,agent_fn,output_dir, iterations, time_resolution = 100000, generation_overlap = False, export_agents = False, new_gamma = None):
+    def __init__(self, read_dir,agent_fn,output_dir, iterations, time_resolution = 100000, 
+                 generation_overlap = False, export_agents = False, new_gamma = None, passed_focuses = None):
         
         self.param_dir = Path(read_dir)
         self.raw_dir = Path(read_dir)/"raw"
@@ -258,6 +290,8 @@ class Imported_Ensemble:
         self.time_resolution = time_resolution
         self.iterations = iterations
         self.num_measurements = iterations/time_resolution
+
+        self.new_gen_focuses = passed_focuses
 
         self.agents_list = []
 
@@ -289,8 +323,6 @@ class Imported_Ensemble:
         self.num_agents = len(self.agents_list)
 
         self.numba_warmup()
-
-
 
     def read_param_file(self):
         """Reads the inputted parameter.csv file and updates/records the relevant ensemble parameter values accordingly"""
@@ -336,6 +368,7 @@ class Imported_Ensemble:
         else:
             selected_focuses = supplied_focuses
 
+
         gen_counts = np.full(self.num_meanings,(self.beta/self.num_meanings))
         for focus in selected_focuses:
             gen_counts[focus] *=gamma
@@ -362,6 +395,7 @@ class Imported_Ensemble:
             inst_focus = self.gen_focuses[i]
             number_focus = len(inst_focus)
             gen_counts, selected_focuses = self.create_generation_counts(number_focuses=number_focus, supplied_focuses=inst_focus, gamma=gamma)
+            print(f"Debug, gen_counts made in recreate agents")
 
             self.gen_alpha_dists.append(gen_counts.tolist())
 
@@ -421,12 +455,19 @@ class Imported_Ensemble:
         blind_success_inner_loop(self.agents_list[0].phi_array,self.agents_list[1].phi_array,self.num_signals,self.num_meanings)
         print("Test blind success outer loop")
         blind_success_outer_loop(self.num_agents,self.ensemble_phi,self.num_signals,self.num_meanings)
-   
+
+
+
+
+   ##########################################################################
     def add_agents(self, number_added):
         """Adds new agents (of a new generation) to the agents list.  Removes corresponding new focuses from the possible focuses,
         increases the counter for the number of agents, and updates the ensemble arrays accordingly."""
         
-        new_generation_counts, selected_focuses = self.create_generation_counts()
+        new_generation_counts, selected_focuses = self.create_generation_counts(supplied_focuses=self.new_gen_focuses)
+        self.gen_focuses.append(self.new_gen_focuses)
+        """Above line in particular will be problematic if adding more than one generation at one time"""
+        ##########################################################################
 
         self.gen_alpha_dists.append(new_generation_counts.tolist())
 
@@ -456,24 +497,44 @@ class Imported_Ensemble:
         # print(f"Length of agent list after is {len(self.agents_list)}") #test
         self.avg_map = self.make_avg_map()
 
+   ##########################################################################
+
+
     def make_avg_map(self):
         avg_map = []
         for i in range(len(self.gen_agent_dict.keys())):
             avg_map.append(len(self.gen_agent_dict[i]))
         return avg_map
 
+    def make_inter_gen_alpha(self, weight_0=0.60, weight_1 = 0.40):
+        ensemble_alphas = np.array(self.gen_alpha_dists)
+        print(ensemble_alphas.shape)
+        self.inter_gen_alpha = ensemble_alphas.mean(axis =0)
+
+        # print(np.array(self.gen_alpha_dists[0]))
+        # print(np.array(self.gen_alpha_dists[1]))
+        # self.inter_gen_alpha = np.array(self.gen_alpha_dists[0]) * weight_0 + np.array(self.gen_alpha_dists[1])*weight_1
+        # print(self.inter_gen_alpha)
+        # print(f"Length of intergen alpha is {self.inter_gen_alpha.shape}")
+
     def one_interaction(self,agent_ids):
         """Iteration procedure for one agent to agent interaction, copied directly from the ensmble class"""
         selected_agents = np.random.choice(agent_ids,size=2, replace=False)
         
         signaller_agent = self.agents_list[selected_agents[0]]
+        signaller_gen_tag = signaller_agent.generation_tag
         
         receiver_agent = self.agents_list[selected_agents[1]]
+        receiver_gen_tag = receiver_agent.generation_tag
         
         selcted_signal_idx,inst_rho = signaller_agent.select_signal_numba()
-        
-        nu_idx = receiver_agent.receive_signal_numba(selcted_signal_idx,inst_rho,self.A)
-        
+
+        if signaller_gen_tag == receiver_gen_tag:
+            nu_idx = receiver_agent.receive_signal_numba(selcted_signal_idx,inst_rho,self.A)
+        else:
+            nu_idx = receiver_agent.receive_signal_intergen(selcted_signal_idx,self.inter_gen_alpha)
+
+
         receiver_agent.update_counts(nu_idx,selcted_signal_idx)
 
     def update_ensemble_arrays(self):
@@ -650,7 +711,8 @@ class Imported_Ensemble:
                         'number_of_gens':self.num_gens,
                         'imported_file': self.param_dir,
                         'avg_map': avg_map,
-                        'gen_alphas': self.gen_alpha_dists
+                        'gen_alphas': self.gen_alpha_dists,
+                        'inter_gen_alpha':self.inter_gen_alpha
         }
         params_df = pd.DataFrame([params_dict])
         params_file = self.output_dir / "simulation_parameters.csv"
@@ -720,17 +782,18 @@ if __name__ =="__main__":
                             default =str(Path.home()/"Downloads"/"MPhys/Code_Runs"))
     parser.add_argument('--Filename', type = str, help='Determines the file to save data to', default= 'Unsorted')
     parser.add_argument('--ImportFile', type = str, help='Determines the file/folder to read the imported data from', default= 'Unsorted')
-    parser.add_argument('--SaveFig', action='store_true', help='If set, saves figures to args.Filename')
-    parser.add_argument('--ShowFig', action='store_true', help='If set, shows figures')
     parser.add_argument('--Generations', action='store_true', help='If set, have independent generations rho distributions')
     parser.add_argument('--GenCount', type = int, help="Determines the number of generations", default=1)
     parser.add_argument('--gamma', type = int, help="Determines the parameter gamma, which controls \
                         how much the generational focus is multiplied by", default=2)
     parser.add_argument('--Focuses', type = int, help="Determines how many focuses are in each generation", default=2)
-    
+    parser.add_argument('--PassedFocuses', type = int,nargs='+', help ="If given inputs, sets the specific focuses of the generation", default = None)
+    parser.add_argument('--TimeRes', type = float, help="Determines how often to collect data, in multipliers of 1 hundred thousand", default = 1.0)
+
 
     args = parser.parse_args()
 
+    time_res = int(args.TimeRes * 100000)
     total_iterations = int(args.iterations * 1000000)
     
     input_dir = Path(args.OutputDir)/args.ImportFile
@@ -745,27 +808,22 @@ if __name__ =="__main__":
 
     agent_func = lambda **kwargs: Agent(meanings,signals,args.lambda_val,args.Alpha,args.Beta,args.NumMeanings,args.NumSignals,**kwargs)
 
-    read_data_ensemble= Imported_Ensemble(input_dir, agent_func, output_directory, iterations=total_iterations,new_gamma=args.gamma)
+    read_data_ensemble= Imported_Ensemble(input_dir, agent_func, output_directory, time_resolution=time_res, iterations=total_iterations,
+                                          new_gamma=args.gamma, passed_focuses=args.PassedFocuses)
 
     # print(len(read_data_ensemble.agents_list))
     # print(read_data_ensemble.gen_focuses)
     # print(read_data_ensemble.possible_focuses)
     # read_data_ensemble.update_ensemble_arrays()
 
-    read_data_ensemble.add_agents(number_added=3)
+    read_data_ensemble.add_agents(number_added=4)
 
     read_data_ensemble.update_ensemble_arrays()
-    mean =read_data_ensemble.ensemble_counts.mean(axis = 0) 
-    # print(mean)
-    # print(mean.shape)
-    print(f"mean max is {np.max(mean)}, mean min is {np.min(mean)}")
-    # print(f"Ensemble alphas are {read_data_ensemble.gen_alpha_dists}")
+
+    read_data_ensemble.make_inter_gen_alpha()
+    # print(read_data_ensemble.inter_gen_alpha)
+
     read_data_ensemble.training_loop()
     # read_data_ensemble.print_lambdas()
 
 
-
-    mean =read_data_ensemble.ensemble_counts.mean(axis = 0) 
-        # print(mean)
-        # print(mean.shape)
-    print(f"mean max is {np.max(mean)}, mean min is {np.min(mean)}")
