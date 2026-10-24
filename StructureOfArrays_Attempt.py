@@ -30,43 +30,44 @@ def delta(i,j):
 """Just a standard dirac delta function to be used in most of the update rules"""
 
 @njit
-def update_phi(signals_meaning_array, alpha_val, alpha_on_s,signal_index,num_meanings):
-    """Update rule for phi is based upon the number of observed counts, i.e., equation 12 in the notes.
-     As I understand the equation, the updates should only take place for the row corresponding to the signal observed!
-     So if the possible signals are dog and cat, and we observe signal cat, we do not touch the phi array values corresponding
-     to signal dog.
+def update_phi_col(signals_meaning_array, alpha_val, alpha_on_s,meaning_index,num_signals):
+    """"Update rule for phi is based upon the number of observed counts, i.e., equation 12 in the notes.
+     As I understand the equation, the updates should only take place for the column corresponding to the meaning interpreted!
+     So if the possible interpreted meanings are dog and cat, and we interpret cat, we do not touch the phi array values corresponding
+     to meaning dog.
 
      The signals are updated according to the following:
      phi_i(s|m;t) = [(n_i(s|m;t)+alpha/S)]/(sum(n_i(s'|m;t))+alpha)
      where sum(n_i(s'|m;t)) corresponds to the sum over signals for that possible meaning, or in othern words the sum of the column
 
      
-     Calculates the updated phi row, and then returns this to be sliced back into the array
+     Calculates the updated phi col, and then returns this to be sliced back into the array
        """
-    new_phi_row = np.empty(num_meanings)
-    signals_meanings_cut = signals_meaning_array[signal_index,:]
-    for m in range(num_meanings):
-        new_phi_row[m] = (signals_meanings_cut[m] +alpha_on_s)/(signals_meaning_array[:,m].sum() +alpha_val)
-
-    return new_phi_row
 
 
-@njit(parallel = True)
+    new_col = np.empty(num_signals)
+    col_to_sum = signals_meaning_array[:,meaning_index]
+    denom = 0.0
+    for i in range(num_signals):
+        denom+=col_to_sum[i]
+
+    denom+=alpha_val
+
+    for j in range(num_signals):
+        new_col[j] = (col_to_sum[j]+alpha_on_s)/denom
+
+    return new_col
+
+
+
+@njit
 def update_signal_meaning(counts_array, lambda_val, meaning_index, signal_index, num_signals):
     """Update rule according to equation 14 in document Evolution of Communications Through Fluctuations"""
-    for i in prange(num_signals):
+    for i in range(num_signals):
         counts_array[i,meaning_index] = delta(i=signal_index, j=i) + (1-lambda_val)*counts_array[i,meaning_index]
     return counts_array
     
     
-@njit(parallel = True)
-def create_phi_tensor(num_agents, agents_list,num_signals,num_meanings):
-    """Compiles all the phi arrays into a singular tensor, to make calculating gain values easier"""
-    phi_tensor = np.empty((num_agents,num_signals,num_meanings))
-    for i in range(num_agents):
-        for j in prange(num_signals):
-            for k in prange(num_meanings):
-                phi_tensor[i,j,k] = agents_list[i].phi_array[j,k]
 
 @njit
 def blind_success_inner_loop(agenti_phi,agentj_phi,num_signals,num_meanings):
@@ -115,19 +116,6 @@ def numba_random_choice(array,prob):
 
 
 ############################################################################################################################
-@njit
-def select_signal_njit(alpha_dist, signals,meanings, phi_array, meanings_list_forIDX):
-    """A numba function for fast meaning selection and signal emission once provided the rho (attentional weight dirichlet) distribution.
-    The attentional weight distribution is calculated using sci-py, which is not supported in numba, thus we have no way to entirely numba-fy
-    this process unless we decide to make a numba calculator of the dirichlet distribution. 
-    """
-    rho_dist = np.random.dirichlet(alpha=alpha_dist)
-    selected_mu = numba_random_choice(meanings,rho_dist)
-    mu_idx = meanings_list_forIDX.index(selected_mu)
-    signal_prob = phi_array[:,mu_idx]
-    selected_signal= numba_random_choice(signals,signal_prob)
-    return selected_signal, rho_dist
-
 
 @njit
 def select_signal_integers_njit(alpha_dist, phi_array,meanings_integers,signals_integers):
@@ -197,10 +185,12 @@ def random_choice_test(upper,amount):
 and one gen cases, solution is to make 2 different functions"""
 @njit(nopython = True)
 def one_interaction_multiple_gens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val):
-    selected_agents = np.random.choice(num_agents,size =2)
-    speaker = int(selected_agents[0])
-    receiver = int(selected_agents[1])
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S):
+    
+    speaker  = np.random.randint(num_agents)
+    receiver = np.random.randint(num_agents - 1)
+    if receiver >= speaker:
+        receiver += 1
 
     speaker_gen_tag = int(speaker_info[speaker,0])
     receiver_gen_tag = int(speaker_info[receiver,0])
@@ -224,17 +214,65 @@ def one_interaction_multiple_gens(counts,phi,speaker_info, meaning_integers, sig
     """Updating the corresponding arrays"""
     counts[receiver,:,:] = update_signal_meaning(receiver_counts,lambda_val,nu_idx,selected_signal_idx,S)
 
-    new_phi_row = update_phi(counts[receiver,:,:],alpha_val,alpha_val/S,selected_signal_idx,M)
-    phi[receiver,selected_signal_idx,:] = new_phi_row
+    new_phi_col = update_phi_col(counts[receiver,:,:],alpha_val,alpha_on_S,nu_idx,S)
+    phi[receiver,:,nu_idx] = new_phi_col
+    
     return phi,counts
+
+@njit(nopython = True)
+def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S):
+    speaker  = np.random.randint(num_agents)
+    receiver = np.random.randint(num_agents - 1)
+    if receiver >= speaker:
+        receiver += 1
+
+    speaker_gen_tag = int(speaker_info[speaker,0])
+    receiver_gen_tag = int(speaker_info[receiver,0])
+    speaker_alpha = alpha_tensor[speaker_gen_tag,:]
+    speaker_phi = phi[speaker,:,:]
+    receiver_phi = phi[receiver,:,:]
+
+    receiver_counts = counts[receiver,:,:]
+
+    selected_signal_idx, rho_dist = select_signal_integers_njit(speaker_alpha,speaker_phi,meaning_integers,signal_integers)
+
+    if speaker_gen_tag==receiver_gen_tag:
+        """Communication between two speakers of same gen, rho is passed"""
+        nu_idx = receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
+    else:
+        receiver_rho = np.random.dirichlet(alpha=alpha_tensor[-1,:])
+        nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
+
+    """Updating the corresponding arrays"""
+    counts[receiver,:,:] = update_signal_meaning(receiver_counts,lambda_val,nu_idx,selected_signal_idx,S)
+
+    new_phi_col = update_phi_col(counts[receiver,:,:],alpha_val,alpha_on_S,nu_idx,S)
+    phi[receiver,:,nu_idx] = new_phi_col
+    
+    return phi,counts
+
 
 @njit
 def one_collection_loop_multiple_gens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,iterations):
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations):
     """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
     for _ in range(iterations):
         new_phi, new_counts = one_interaction_multiple_gens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val)
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S)
+        counts = new_counts
+        phi = new_phi
+
+    return phi, counts
+
+
+@njit
+def one_collection_loop_intergens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations):
+    """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
+    for _ in range(iterations):
+        new_phi, new_counts = one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S)
         counts = new_counts
         phi = new_phi
 
@@ -243,13 +281,15 @@ def one_collection_loop_multiple_gens(counts,phi,speaker_info, meaning_integers,
 
 """Now doing the single generation interaction processes"""
 @njit
-def one_interaction_one_population(counts,phi, meaning_integers, signal_integers,num_agents, 
-                                  alpha_vector,M, S, lambda_val,alpha_val, alignment):
+def one_interaction_one_population(counts,phi, meaning_integers, signal_integers,num_agents,
+                                  alpha_vector,M, S, lambda_val,alpha_val,alpha_on_S, alignment):
     """Interaction rules for an ensemble of speakers all from one population"""
     
-    selected_agents = np.random.choice(num_agents,size =2)
-    speaker = int(selected_agents[0])
-    receiver = int(selected_agents[1])
+    speaker  = np.random.randint(num_agents)
+    receiver = np.random.randint(num_agents - 1)
+    if receiver >= speaker:
+        receiver += 1
+
     speaker_phi = phi[speaker,:,:]
     receiver_phi = phi[receiver,:,:]
 
@@ -270,18 +310,18 @@ def one_interaction_one_population(counts,phi, meaning_integers, signal_integers
     """Updating the corresponding arrays"""
     counts[receiver,:,:] = update_signal_meaning(receiver_counts,lambda_val,nu_idx,selected_signal_idx,S)
 
-    new_phi_row = update_phi(counts[receiver,:,:],alpha_val,alpha_val/S,selected_signal_idx,M)
-    phi[receiver,selected_signal_idx,:] = new_phi_row
+    new_phi_col = update_phi_col(counts[receiver,:,:],alpha_val,alpha_on_S,nu_idx,S)
+    phi[receiver,:,nu_idx] = new_phi_col
 
     return phi,counts
 
 @njit
 def one_collection_loop_one_pop(counts,phi, meaning_integers, signal_integers,num_agents, 
-                                  alpha_vector,M, S, lambda_val,alpha_val, alignment,iterations):
+                                  alpha_vector,M, S, lambda_val,alpha_val,alpha_on_s, alignment,iterations):
     """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
     for _ in range(iterations):
         new_phi, new_counts = one_interaction_one_population(counts,phi, meaning_integers, signal_integers,num_agents, 
-                                  alpha_vector,M, S, lambda_val,alpha_val, alignment)
+                                  alpha_vector,M, S, lambda_val,alpha_val,alpha_on_s, alignment)
         counts = new_counts
         phi = new_phi
 
@@ -338,7 +378,7 @@ class Ensemble:
             assert self.imported_signals== self.S, "Imported signals and inputted signals do not match"
             self.num_gens = len(self.imported_gen_focuses)-1
             self.create_initial_tensors_from_inputs()
-            self.gen_focuses.append(self.imported_gen_focuses)
+            # self.gen_focuses.append(self.imported_gen_focuses)
             print(f"Debug, self.speaker_info is {self.speaker_info}")
 
         else:
@@ -373,7 +413,6 @@ class Ensemble:
         self.imported_gen_focuses = params_df['generation_focuses'].apply(ast.literal_eval)[0]
         self.imported_A = params_df['alignment'][0]
         #Need the extra handling to convert the csv's string back into an actual python list
-        self.imported_certainty = params_df['certainty'][0]
 
     def create_generation_focuses(self,number_focuses = 2, supplied_focuses = None, remove_focuses = True, gamma = None):
         """A function to return attentional counts, modified by a select number of attentional focuses, for a generation.  
@@ -395,7 +434,7 @@ class Ensemble:
             self.gen_focuses.append(selected_focuses.tolist())
         else:
             selected_focuses = supplied_focuses
-
+            self.gen_focuses.append(selected_focuses)
 
         gen_counts = np.full(self.M,(self.beta/self.M))
         for focus in selected_focuses:
@@ -451,7 +490,7 @@ class Ensemble:
             gen_counts, selected_focuses = self.create_generation_focuses(number_focuses=2, supplied_focuses = passed_focuses)
             self.alpha_tensor = np.array(gen_counts)
         else:
-            self.alpha_tensor = np.full((self.M), fill_value=(self.beta/self.S))
+            self.alpha_tensor = np.full((self.M), fill_value=(self.beta/self.M))
 
         self.population_phi = np.full((num_agents, self.S,self.M), fill_value=1/self.S)
         self.population_counts = np.zeros((num_agents, self.S,self.M))
@@ -473,15 +512,15 @@ class Ensemble:
 
     def numba_warmup(self):
         test_array = np.array([0,1])
-        dummy_matrix = self.population_phi[0,:,:]
-        dummy_alpha = self.alpha_tensor
+        dummy_matrix = np.full((self.S, self.M), 1.0/self.S)
+        dummy_alpha= np.full(self.M, self.beta/self.M)
 
         print("Initialising Numba Functions")
         print("Testing delta")
         delta(1,1)
         print("Testing update_phi")
-        update_phi(dummy_matrix,
-                   self.alpha,self.alpha_on_s,1,self.M)
+        update_phi_col(dummy_matrix,
+                   self.alpha,self.alpha_on_s,1,self.S)
 
         print("Testing update_signal meaning")
         update_signal_meaning(dummy_matrix,self.lambda_val,1,1,self.S)  
@@ -503,99 +542,99 @@ class Ensemble:
         blind_success_outer_loop(self.num_agents,self.population_phi,self.S,self.M)
 
     def generate_initial_h5_file(self):
-            """Generates the h5_file used to store data as the experiment runs, should only be 
-            used after the initial ensemble arrays have been calculated"""
-            save_dir = self.output_dir/"raw"
-            save_dir.mkdir(parents = True, exist_ok = True)
-            self.h5_file = h5py.File(name =save_dir/"array_data.h5", mode = 'w')
+        """Generates the h5_file used to store data as the experiment runs, should only be 
+        used after the initial ensemble arrays have been calculated"""
+        save_dir = self.output_dir/"raw"
+        save_dir.mkdir(parents = True, exist_ok = True)
+        self.h5_file = h5py.File(name =save_dir/"array_data.h5", mode = 'w')
 
-            """Ensemble_Phi Data"""
-            self.h5_phi_group = self.h5_file.create_group(name = 'Phi')
-            self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (self.num_measurements,self.S, self.M), 
-                                                        dtype = np.float64, chunks = True)
-            self.h5_phi_dataset.attrs['description'] = 'Ensemble phi arrays over time'
-            self.h5_phi_dataset.attrs['num_signals'] = self.S
-            self.h5_phi_dataset.attrs['num_meanings'] = self.M
+        """Ensemble_Phi Data"""
+        self.h5_phi_group = self.h5_file.create_group(name = 'Phi')
+        self.h5_phi_dataset = self.h5_phi_group.create_dataset(name = 'phi_dataset', shape = (self.num_measurements,self.S, self.M), 
+                                                    dtype = np.float64, chunks = True)
+        self.h5_phi_dataset.attrs['description'] = 'Ensemble phi arrays over time'
+        self.h5_phi_dataset.attrs['num_signals'] = self.S
+        self.h5_phi_dataset.attrs['num_meanings'] = self.M
 
-            self.h5_phi_dataset[0,:,:] = self.population_phi.mean(axis =0)
-
-
-            """Generation specific phi data"""
-            self.h5_phi_gens_dataset = self.h5_phi_group.create_dataset(name = 'phi_gens_dataset', shape = (self.num_measurements,self.num_gens+1,self.S,
-                        self.M),maxshape = (self.num_measurements,None, self.S, self.M),
-                        dtype = np.float64, chunks = True)
-            #Want it to be none in both the first and second generation to allow in simulation updates later on
-            self.h5_phi_gens_dataset.attrs['description'] = 'Generation specific average phi arrays over time'
-            self.h5_phi_gens_dataset.attrs['num_signals'] = self.S
-            self.h5_phi_gens_dataset.attrs['num_meanings'] = self.M
-            self.h5_phi_gens_dataset.attrs['num_gens'] = self.num_gens
+        self.h5_phi_dataset[0,:,:] = self.population_phi.mean(axis =0)
 
 
-            # print(f"Starting h5_phi_gens values")
-            # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
-            # print(f"Avg map is {self.avg_map}")
-            start_idx = 0
-            for i in range(self.num_gens+1):
-                # print(i)
-                end_idx = start_idx+self.avg_map[i]
-                gens_phi = self.population_phi[start_idx:end_idx,:,:]
-                # print(f"Shape of gens_phi is {gens_phi.shape}")
-
-                self.h5_phi_gens_dataset[0,i,:,:] = gens_phi.mean(axis =0)
-                start_idx = end_idx
-
-            
-            """Ensemble_n(S|M) Data"""
-            self.h5_counts_group = self.h5_file.create_group(name = 'counts')
-            self.h5_counts_dataset = self.h5_counts_group.create_dataset(name = 'counts_dataset', 
-                        shape = (self.num_measurements, self.S, self.M), dtype = np.float64, chunks = True)
-            self.h5_counts_dataset.attrs['description'] = "Ensemble signal meaning count array over time "
-            self.h5_counts_dataset.attrs['num_signals'] = self.S
-            self.h5_counts_dataset.attrs['num_meanings'] = self.M
-
-            self.h5_counts_dataset[0,:,:] = self.population_counts.mean(axis =0)
+        """Generation specific phi data"""
+        self.h5_phi_gens_dataset = self.h5_phi_group.create_dataset(name = 'phi_gens_dataset', shape = (self.num_measurements,self.num_gens+1,self.S,
+                    self.M),maxshape = (self.num_measurements,None, self.S, self.M),
+                    dtype = np.float64, chunks = True)
+        #Want it to be none in both the first and second generation to allow in simulation updates later on
+        self.h5_phi_gens_dataset.attrs['description'] = 'Generation specific average phi arrays over time'
+        self.h5_phi_gens_dataset.attrs['num_signals'] = self.S
+        self.h5_phi_gens_dataset.attrs['num_meanings'] = self.M
+        self.h5_phi_gens_dataset.attrs['num_gens'] = self.num_gens
 
 
-            """Generation specific counts data, copying same overall structure as the gens phi"""
-            self.h5_counts_gens_dataset = self.h5_counts_group.create_dataset(name = 'counts_gens_dataset', 
-                shape = (self.num_measurements,self.num_gens+1,self.S, self.M),
-                maxshape = (self.num_measurements,None, self.S, self.M),dtype = np.float64, chunks = True)
-            #Want it to be none in both the first and second generation to allow in simulation updates later on
-            self.h5_counts_gens_dataset.attrs['description'] = 'Generation specific average counts arrays over time'
-            self.h5_counts_gens_dataset.attrs['num_signals'] = self.S
-            self.h5_counts_gens_dataset.attrs['num_meanings'] = self.M
-            self.h5_counts_gens_dataset.attrs['num_gens'] = self.num_gens
+        # print(f"Starting h5_phi_gens values")
+        # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
+        # print(f"Avg map is {self.avg_map}")
+        start_idx = 0
+        for i in range(self.num_gens+1):
+            # print(i)
+            end_idx = start_idx+self.avg_map[i]
+            gens_phi = self.population_phi[start_idx:end_idx,:,:]
+            # print(f"Shape of gens_phi is {gens_phi.shape}")
+
+            self.h5_phi_gens_dataset[0,i,:,:] = gens_phi.mean(axis =0)
+            start_idx = end_idx
+
+        
+        """Ensemble_n(S|M) Data"""
+        self.h5_counts_group = self.h5_file.create_group(name = 'counts')
+        self.h5_counts_dataset = self.h5_counts_group.create_dataset(name = 'counts_dataset', 
+                    shape = (self.num_measurements, self.S, self.M), dtype = np.float64, chunks = True)
+        self.h5_counts_dataset.attrs['description'] = "Ensemble signal meaning count array over time "
+        self.h5_counts_dataset.attrs['num_signals'] = self.S
+        self.h5_counts_dataset.attrs['num_meanings'] = self.M
+
+        self.h5_counts_dataset[0,:,:] = self.population_counts.mean(axis =0)
 
 
-            # print(f"Starting h5_counts_gens values")
-            # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
-            # print(f"Avg map is {self.avg_map}")
-            start_idx = 0
-            for i in range(self.num_gens+1):
-                print(i)
-                end_idx = start_idx+self.avg_map[i]
-                gens_counts = self.population_counts[start_idx:end_idx,:,:]
-                print(f"Shape of gens_counts is {gens_counts.shape}")
-
-                self.h5_counts_gens_dataset[0,i,:,:] = gens_counts.mean(axis =0)
-                start_idx = end_idx
-
-            """If self.export_agents set to true, we need an array to save the final phi and count arrays from all agents """
-            if self.export_agents:
-                self.h5_agents_phi_group = self.h5_file.create_group(name = 'agents_phi')
-                self.h5_agents_phi_data =self.h5_agents_phi_group.create_dataset(name = 'agents_phi_data', 
-                                                                                shape = (self.num_agents,self.S,self.M), dtype = np.float64)
-                self.h5_agents_phi_data.attrs['description'] = "Each agent in the simulation's final phi array"
-                self.h5_agents_phi_data.attrs['num_signals'] = self.S
-                self.h5_agents_phi_data.attrs['num_meanings'] = self.M
+        """Generation specific counts data, copying same overall structure as the gens phi"""
+        self.h5_counts_gens_dataset = self.h5_counts_group.create_dataset(name = 'counts_gens_dataset', 
+            shape = (self.num_measurements,self.num_gens+1,self.S, self.M),
+            maxshape = (self.num_measurements,None, self.S, self.M),dtype = np.float64, chunks = True)
+        #Want it to be none in both the first and second generation to allow in simulation updates later on
+        self.h5_counts_gens_dataset.attrs['description'] = 'Generation specific average counts arrays over time'
+        self.h5_counts_gens_dataset.attrs['num_signals'] = self.S
+        self.h5_counts_gens_dataset.attrs['num_meanings'] = self.M
+        self.h5_counts_gens_dataset.attrs['num_gens'] = self.num_gens
 
 
-                self.h5_agents_counts_group = self.h5_file.create_group(name = 'agents_counts')
-                self.h5_agents_counts_data =self.h5_agents_counts_group.create_dataset(name = 'agents_counts_data', 
-                                                                                shape = (self.num_agents,self.S,self.M), dtype = np.float64)
-                self.h5_agents_counts_data.attrs['description'] = "Each agent in the simulation's final phi array"
-                self.h5_agents_counts_data.attrs['num_signals'] = self.S
-                self.h5_agents_counts_data.attrs['num_meanings'] = self.M
+        # print(f"Starting h5_counts_gens values")
+        # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
+        # print(f"Avg map is {self.avg_map}")
+        start_idx = 0
+        for i in range(self.num_gens+1):
+            print(i)
+            end_idx = start_idx+self.avg_map[i]
+            gens_counts = self.population_counts[start_idx:end_idx,:,:]
+            print(f"Shape of gens_counts is {gens_counts.shape}")
+
+            self.h5_counts_gens_dataset[0,i,:,:] = gens_counts.mean(axis =0)
+            start_idx = end_idx
+
+        """If self.export_agents set to true, we need an array to save the final phi and count arrays from all agents """
+        if self.export_agents:
+            self.h5_agents_phi_group = self.h5_file.create_group(name = 'agents_phi')
+            self.h5_agents_phi_data =self.h5_agents_phi_group.create_dataset(name = 'agents_phi_data', 
+                                                                            shape = (self.num_agents,self.S,self.M), dtype = np.float64)
+            self.h5_agents_phi_data.attrs['description'] = "Each agent in the simulation's final phi array"
+            self.h5_agents_phi_data.attrs['num_signals'] = self.S
+            self.h5_agents_phi_data.attrs['num_meanings'] = self.M
+
+
+            self.h5_agents_counts_group = self.h5_file.create_group(name = 'agents_counts')
+            self.h5_agents_counts_data =self.h5_agents_counts_group.create_dataset(name = 'agents_counts_data', 
+                                                                            shape = (self.num_agents,self.S,self.M), dtype = np.float64)
+            self.h5_agents_counts_data.attrs['description'] = "Each agent in the simulation's final phi array"
+            self.h5_agents_counts_data.attrs['num_signals'] = self.S
+            self.h5_agents_counts_data.attrs['num_meanings'] = self.M
 
     def save_to_file(self,idx_iter):
         """Save the experimental data to a file as it is calculated/experiment is performed"""
@@ -683,10 +722,10 @@ class Ensemble:
 
         if speakers_focuses is not None:
             gen_counts, selected_focuses = self.create_generation_focuses(number_focuses=2, supplied_focuses = speakers_focuses)
-            self.gen_focuses.append(selected_focuses)
+            # self.gen_focuses.append(selected_focuses)
             new_alpha = np.array(gen_counts)
         else:
-            new_alpha = np.full((self.M), fill_value=(self.beta/self.S))
+            new_alpha = np.full((self.M), fill_value=(self.beta/self.M))
     
         self.alpha_tensor = np.vstack((self.alpha_tensor,new_alpha))
         self.num_agents+=speakers_added
@@ -705,29 +744,52 @@ class Ensemble:
         self.alpha_tensor = np.vstack((self.alpha_tensor,inter_gen_alpha))
         """Will need a way of thinking about how to do this in the case we have 3+ generations communicating, as it currently is written it would fail"""
 
-    def one_interaction_multiple_gens_numba_test(self):
+    def numba_warmup_multiple_gens(self):
+        dummy_counts = np.zeros((self.num_agents,self.S, self.M))
+        dummy_phi    = np.full((self.num_agents,self.S, self.M), 1.0/self.S)
+        dummy_alpha  = np.full(shape=(self.num_gens,self.M), fill_value=self.beta/self.M)
+
+        
         print(f"Debug, testing one interaction numba")
-        new_phi,new_counts = one_interaction_multiple_gens(self.population_counts,self.population_phi,self.speaker_info,self.meanings_integers,
-                                                           self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                           self.S,self.lambda_val,self.alpha)
-
-    def one_loop_multiple_gens_numba_test(self):
+        new_phi,new_counts = one_interaction_multiple_gens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
+                                                           self.signals_integers,self.num_agents,dummy_alpha,self.M,
+                                                           self.S,self.lambda_val,self.alpha,self.alpha_on_s)
         print(f"Debug, testing one data loop numba")
-        new_phi,new_counts = one_collection_loop_multiple_gens(self.population_counts,self.population_phi,self.speaker_info,self.meanings_integers,
-                                                                   self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                                   self.S,self.lambda_val,self.alpha, iterations=2)
+        new_phi,new_counts = one_collection_loop_multiple_gens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
+                                                                           self.signals_integers,self.num_agents,dummy_alpha,self.M,
+                                                                           self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=2)
+    
+    def numba_warmup_intergen(self):
+        print(f"Performing numba warmups for intergen")
+        dummy_counts = np.zeros((self.num_agents,self.S, self.M))
+        dummy_phi    = np.full((self.num_agents,self.S, self.M), 1.0/self.S)
+        dummy_alpha  = np.full(shape=(self.num_gens+1,self.M), fill_value=self.beta/self.M)
+        # print(f"Debug : numba_warmup_intergen : dummy alpha is {dummy_alpha}")
 
+
+        new_phi,new_counts = one_interaction_intergen(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
+                                                                   self.signals_integers,self.num_agents,dummy_alpha,self.M,
+                                                                   self.S,self.lambda_val,self.alpha,self.alpha_on_s)
+        new_phi,new_counts = one_collection_loop_intergens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
+                                                                           self.signals_integers,self.num_agents,dummy_alpha,self.M,
+                                                                           self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=2)
+        
     def one_interaction_one_pop_numba_test(self):
         print(f"Debug, testing one population numba tests")
+        dummy_counts = np.zeros((self.num_agents,self.S, self.M))
+        dummy_phi    = np.full((self.num_agents,self.S, self.M), 1.0/self.S)
+        dummy_alpha  = np.full(shape=(self.M), fill_value=self.beta/self.M)
 
-        newphi,new_counts = one_interaction_one_population(self.population_counts,self.population_phi,self.meanings_integers,
-                                                           self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                           self.S,self.lambda_val,alpha_val=self.alpha,alignment=self.A)
+
+        newphi,new_counts = one_interaction_one_population(dummy_counts,dummy_phi,self.meanings_integers,
+                                                           self.signals_integers,self.num_agents,dummy_alpha,self.M,
+                                                           self.S,self.lambda_val,alpha_val=self.alpha,alpha_on_S=self.alpha_on_s,alignment=self.A)
 
         print(f"Testing training loop")
-        new_phi,new_counts = one_collection_loop_one_pop(self.population_counts,self.population_phi,self.meanings_integers,
-                                                           self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                           self.S,self.lambda_val,self.alpha,alignment=self.A, iterations=2)
+        new_phi,new_counts = one_collection_loop_one_pop(dummy_counts,dummy_phi,self.meanings_integers,
+                                                           self.signals_integers,self.num_agents,dummy_alpha,self.M,
+                                                           self.S,self.lambda_val,self.alpha,alpha_on_s=self.alpha_on_s,alignment=self.A, iterations=2)
+
 
     def training_loop_one_pop(self):
         print(f"Caching required numba functions")
@@ -738,11 +800,13 @@ class Ensemble:
             new_population_phi, new_population_counts = one_collection_loop_one_pop(self.population_counts,
                                                                     self.population_phi,self.meanings_integers,
                                                                    self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                                   self.S,self.lambda_val,self.alpha,alignment=self.A, iterations=self.time_res)
+                                                                   self.S,self.lambda_val,self.alpha,alpha_on_s=self.alpha_on_s,
+                                                                   alignment=self.A, iterations=self.time_res)
             self.save_to_file(idx_iter=i)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
             print(f"Completed iteration {(i+1) * self.time_res}")
+            assert np.allclose(self.population_phi.sum(axis=1), 1.0) #Check to make sure all the phi columns sum to 1
         
         if self.export_agents:
             self.save_agents_data()
@@ -764,6 +828,7 @@ class Ensemble:
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
             print(f"Completed iteration {(i+1) * self.time_res}")
+            assert np.allclose(self.population_phi.sum(axis=1), 1.0) #Check to make sure all the phi columns sum to 1
         
         if self.export_agents:
             self.save_agents_data()
@@ -771,6 +836,25 @@ class Ensemble:
         self.save_params(iterations = self.tot_iterations)
         
 
+    def training_loop_intergen(self):
+        print(f"Caching required numba functions")
+        self.numba_warmup_intergen()
+
+        self.generate_initial_h5_file()
+        for i in range(self.num_measurements):
+            new_population_phi, new_population_counts = one_collection_loop_intergens(self.population_counts,
+                                                                    self.population_phi,self.speaker_info,self.meanings_integers,
+                                                                    self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
+                                                                    self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=self.time_res)
+            self.save_to_file(idx_iter=i)
+            self.population_phi = new_population_phi
+            self.population_counts = new_population_counts
+            print(f"Completed iteration {(i+1) * self.time_res}")
+            assert np.allclose(self.population_phi.sum(axis=1), 1.0) #Check to make sure all the phi columns sum to 1
+        if self.export_agents:
+            self.save_agents_data()
+
+        self.save_params(iterations = self.tot_iterations)
 
 
 if __name__ == "__main__":
@@ -797,6 +881,8 @@ if __name__ == "__main__":
     parser.add_argument('--PassedFocuses', type = int,nargs='+', help ="If given inputs, sets the specific focuses of the generation", default = None)
     parser.add_argument('--TimeRes', type = float, help="Determines how often to collect data, in multipliers of 1 hundred thousand", default = 1.0)
     parser.add_argument('--Export', action='store_true', help='If set, exports the agents')
+    parser.add_argument('--Import', action='store_true', help='If set, lets us import agents')
+
     args = parser.parse_args()
 
     print("Past args")
@@ -813,7 +899,7 @@ if __name__ == "__main__":
     debugging_ensemble = Ensemble(input_dir, output_directory, alignment=args.alignment, beta=args.Beta, alpha = args.Alpha,
                                   lambda_val=args.lambda_val,num_meanings=args.NumMeanings,num_signals=args.NumSignals,
                                    time_resolution=time_res, iterations=total_iterations, new_gamma=args.gamma, 
-                                   passed_focuses=args.PassedFocuses, import_agents=False, non_input_initialisation_agents=args.NumAgents,
+                                   passed_focuses=args.PassedFocuses, import_agents=args.Import, non_input_initialisation_agents=args.NumAgents,
                                    export_agents=args.Export)
     
     
@@ -823,5 +909,12 @@ if __name__ == "__main__":
     # print(f"Debug Shape of intergen_tensor = {debugging_ensemble.inter_gen_alpha.shape}, and is {debugging_ensemble.inter_gen_alpha}")
     train_start_time = time.time()
     debugging_ensemble.training_loop_one_pop()
+
+    # debugging_ensemble.add_speakers(args.NumAgents,speakers_focuses= args.PassedFocuses)
+    # print(f"Debug: debugging_ensemble.gen_focuses is {debugging_ensemble.gen_focuses}")
+    # debugging_ensemble.add_intergen_alpha(gen_0_weight=0.90, gen_1_weight= 0.1)
+    # debugging_ensemble.training_loop_intergen()
+
+
     train_end_time = time.time()
     print(f"Runtime is {train_end_time-train_start_time}" )
