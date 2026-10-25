@@ -221,7 +221,7 @@ def one_interaction_multiple_gens(counts,phi,speaker_info, meaning_integers, sig
 
 @njit(nopython = True)
 def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S):
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S, alignment):
     speaker  = np.random.randint(num_agents)
     receiver = np.random.randint(num_agents - 1)
     if receiver >= speaker:
@@ -229,20 +229,47 @@ def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_i
 
     speaker_gen_tag = int(speaker_info[speaker,0])
     receiver_gen_tag = int(speaker_info[receiver,0])
-    speaker_alpha = alpha_tensor[speaker_gen_tag,:]
+
+
     speaker_phi = phi[speaker,:,:]
     receiver_phi = phi[receiver,:,:]
 
     receiver_counts = counts[receiver,:,:]
 
-    selected_signal_idx, rho_dist = select_signal_integers_njit(speaker_alpha,speaker_phi,meaning_integers,signal_integers)
+    """If they are of the same population they pass their rho's with prob ~ alignment A, if they are of different generations, then BOTH 
+    agents use the intergen alpha counts, however this is still passed with alignment A"""
+
 
     if speaker_gen_tag==receiver_gen_tag:
-        """Communication between two speakers of same gen, rho is passed"""
-        nu_idx = receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
+        """Same generation branch, we use the alpha from the speaker/receiver gen_tag, and pass the inst rho off with prob ~ Alignment"""
+
+        speaker_alpha = alpha_tensor[speaker_gen_tag,:]
+        selected_signal_idx, rho_dist = select_signal_integers_njit(speaker_alpha,speaker_phi,meaning_integers,signal_integers)
+
+        if np.random.rand()<= alignment:
+            """Pass the rho distribution"""
+            nu_idx = receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
+
+        else:
+            """Receiver must create their own rho distribution"""
+            receiver_rho = np.random.dirichlet(alpha = speaker_alpha) #Can still reuse speaker alpha since they were same gen
+            nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
+
     else:
-        receiver_rho = np.random.dirichlet(alpha=alpha_tensor[-1,:])
-        nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
+        """If the speaker and receiver do not have the same gen tag, then we must use the intergen alpha for both"""
+        intergen_alpha = alpha_tensor[-1,:]
+        """NOTE: Above will need to change as soon as dealing with more complex systems (i.e., more than 2 gens)"""
+        selected_signal_idx, rho_dist = select_signal_integers_njit(intergen_alpha,speaker_phi,meaning_integers,signal_integers)
+
+        if np.random.rand() <= alignment:
+            """Pass rho dist"""
+            nu_idx =receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
+        else:
+            receiver_rho = np.random.dirichlet(alpha=intergen_alpha)
+            nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
+
+
+
 
     """Updating the corresponding arrays"""
     counts[receiver,:,:] = update_signal_meaning(receiver_counts,lambda_val,nu_idx,selected_signal_idx,S)
@@ -268,11 +295,11 @@ def one_collection_loop_multiple_gens(counts,phi,speaker_info, meaning_integers,
 
 @njit
 def one_collection_loop_intergens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations):
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations, alignment):
     """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
     for _ in range(iterations):
         new_phi, new_counts = one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S)
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,alignment)
         counts = new_counts
         phi = new_phi
 
@@ -374,10 +401,12 @@ class Ensemble:
         if import_agents:
             self.read_param_file()
             print("Read file")
+            print(f"Debug: Len of self.imported_gen_focuses is {len(self.imported_gen_focuses)}")
+            imported_focus_bool = len(self.imported_gen_focuses)
             assert self.imported_meanings== self.M, "Imported meanings and inputted meanings do not match"
             assert self.imported_signals== self.S, "Imported signals and inputted signals do not match"
             self.num_gens = len(self.imported_gen_focuses)-1
-            self.create_initial_tensors_from_inputs()
+            self.create_initial_tensors_from_inputs(imported_focus_bool)
             # self.gen_focuses.append(self.imported_gen_focuses)
             print(f"Debug, self.speaker_info is {self.speaker_info}")
 
@@ -447,7 +476,7 @@ class Ensemble:
 
 
     #############################################################################################################################################
-    def create_initial_tensors_from_inputs(self):
+    def create_initial_tensors_from_inputs(self, focuses_bool):
         """Function to create the initial ensemble tensors from imported data"""
         with h5py.File(self.raw_dir/"array_data.h5", 'r') as f:
             final_phis = f['agents_phi']['agents_phi_data']
@@ -458,11 +487,14 @@ class Ensemble:
             self.avg_map.append(self.num_imported_agents)
 
             #############################################################################################################################################
-            gen_counts, focuses = self.create_generation_focuses(2, supplied_focuses= self.imported_gen_focuses[0], gamma=self.imported_gamma)
-            
+            if focuses_bool!= 0:
+                gen_counts, focuses = self.create_generation_focuses(2, supplied_focuses= self.imported_gen_focuses[0], gamma=self.imported_gamma)
+                self.alpha_tensor = np.array(gen_counts)
+            else:
+                self.alpha_tensor = np.full((self.M), fill_value=(self.beta/self.M))
             """NOTE: Above line will absolutely break if importing more than one generation, special care will be needed when that is done"""
             #############################################################################################################################################
-            self.alpha_tensor = np.array(gen_counts)
+            
         f.close()
 
         num_added = self.population_phi.shape[0]
@@ -747,7 +779,7 @@ class Ensemble:
     def numba_warmup_multiple_gens(self):
         dummy_counts = np.zeros((self.num_agents,self.S, self.M))
         dummy_phi    = np.full((self.num_agents,self.S, self.M), 1.0/self.S)
-        dummy_alpha  = np.full(shape=(self.num_gens,self.M), fill_value=self.beta/self.M)
+        dummy_alpha  = np.full(shape=(self.num_gens+1,self.M), fill_value=self.beta/self.M)
 
         
         print(f"Debug, testing one interaction numba")
@@ -769,10 +801,10 @@ class Ensemble:
 
         new_phi,new_counts = one_interaction_intergen(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                                    self.signals_integers,self.num_agents,dummy_alpha,self.M,
-                                                                   self.S,self.lambda_val,self.alpha,self.alpha_on_s)
+                                                                   self.S,self.lambda_val,self.alpha,self.alpha_on_s, alignment =1.0)
         new_phi,new_counts = one_collection_loop_intergens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
-                                                                           self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=2)
+                                                                           self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=2, alignment=1.0)
         
     def one_interaction_one_pop_numba_test(self):
         print(f"Debug, testing one population numba tests")
@@ -795,6 +827,14 @@ class Ensemble:
         print(f"Caching required numba functions")
         self.one_interaction_one_pop_numba_test()
 
+        """Need a check to collapse the alpha tensor into one vector if there are more than one alphas.  Logic for doing so is it 
+        is easier to implement a check here, than to implement checks at every single instantiation of an agent/speaker group"""
+
+        print(f"Debug: self.alpha_tensor.ndim is {self.alpha_tensor.ndim}")
+        if self.alpha_tensor.ndim>1:
+            """If the alpha tensor is greater than 1, we have more than one alpha tensor, and thus it needs to be reduced to a single vector"""
+            self.alpha_tensor = self.alpha_tensor.mean(axis = 0)
+
         self.generate_initial_h5_file()
         for i in range(self.num_measurements):
             new_population_phi, new_population_counts = one_collection_loop_one_pop(self.population_counts,
@@ -815,15 +855,14 @@ class Ensemble:
 
     def training_loop_multiple_gens(self):
         print(f"Caching required numba functions")
-        self.one_interaction_multiple_gens_numba_test()
-        self.one_loop_multiple_gens_numba_test()
+        self.numba_warmup_multiple_gens()
 
         self.generate_initial_h5_file()
         for i in range(self.num_measurements):
             new_population_phi, new_population_counts = one_collection_loop_multiple_gens(self.population_counts,
                                                                     self.population_phi,self.speaker_info,self.meanings_integers,
                                                                    self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                                   self.S,self.lambda_val,self.alpha, iterations=self.time_res)
+                                                                   self.S,self.lambda_val,self.alpha,self.alpha_on_s, iterations=self.time_res)
             self.save_to_file(idx_iter=i)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
@@ -845,7 +884,8 @@ class Ensemble:
             new_population_phi, new_population_counts = one_collection_loop_intergens(self.population_counts,
                                                                     self.population_phi,self.speaker_info,self.meanings_integers,
                                                                     self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                                    self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=self.time_res)
+                                                                    self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=self.time_res, 
+                                                                    alignment = self.A)
             self.save_to_file(idx_iter=i)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
@@ -908,12 +948,13 @@ if __name__ == "__main__":
     # debugging_ensemble.generate_initial_h5_file()
     # print(f"Debug Shape of intergen_tensor = {debugging_ensemble.inter_gen_alpha.shape}, and is {debugging_ensemble.inter_gen_alpha}")
     train_start_time = time.time()
-    debugging_ensemble.training_loop_one_pop()
+    # debugging_ensemble.training_loop_one_pop()
 
-    # debugging_ensemble.add_speakers(args.NumAgents,speakers_focuses= args.PassedFocuses)
+    debugging_ensemble.add_speakers(args.NumAgents,speakers_focuses=args.PassedFocuses)
     # print(f"Debug: debugging_ensemble.gen_focuses is {debugging_ensemble.gen_focuses}")
-    # debugging_ensemble.add_intergen_alpha(gen_0_weight=0.90, gen_1_weight= 0.1)
-    # debugging_ensemble.training_loop_intergen()
+    debugging_ensemble.add_intergen_alpha(gen_0_weight=0.50, gen_1_weight= 0.50)
+    debugging_ensemble.training_loop_intergen()
+    # debugging_ensemble.training_loop_multiple_gens()
 
 
     train_end_time = time.time()
