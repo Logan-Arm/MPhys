@@ -17,6 +17,12 @@ import time
 #Numba Section
 ###
 
+
+###############################################################
+"""Start of numba helper function section.  Just contains helper functions which have been 
+made because either their standard NumPy equivalent is not supported in numba, or because 
+it would be space inefficient to repeatedly write out."""
+
 @njit
 def numba_col_sum(array,mu_index):
     total = 0.0
@@ -26,8 +32,47 @@ def numba_col_sum(array,mu_index):
 
 @njit
 def delta(i,j):
+    """Just a standard dirac delta function to be used in most of the update rules, made in 
+    numba so we do not have to repeatedly leave and re-enter nonpython mode, which would 
+    otherwise be a slowdown"""
     return 1 if i==j else 0
-"""Just a standard dirac delta function to be used in most of the update rules"""
+
+@njit
+def numba_random_choice(array,prob):
+    """Numba does not accept the probability distribution for the np.random.choice() function, as such we need a workaround to be able to handle 
+    this efficiently.  This function was taken from the numba support issue 2539, specifically from commentor Mike Fenton
+    
+    :param arr: A 1D numpy array of values to sample from.
+    :param prob: A 1D numpy array of probabilities for the given samples.
+    :return: A random sample from the given array with a given probability.
+
+    
+    """
+    return array[np.searchsorted(np.cumsum(prob), np.random.random(), side="right")]
+
+@njit
+def random_choice_test(upper,amount):
+    for _ in range(amount):
+        print(np.random.choice(upper,size = 2))
+
+
+"""End of the numba helper function section"""
+###############################################################
+"""Start of the core mechanics of the model.  The following section contains all the key 
+interaction rules: signal selection, signal interpretation, and update of own communication 
+structure.  
+
+It should be explicitly noted that very little of these functions are parallel, this is intentional.
+At the scale these matrices tend to be working on (no more than ~15-20 signals or meanings), the overhead
+of assigning cpu cores for the parallelisation is slower than the pure jit runtime.  I can say this confidently
+as this was actually parallelised before, and it ran remarkably slower.  
+
+Furthermore, very little numpy functions are used throughout. This is also intentional.  Most numpy functions 
+when ran in the numba interpretor will have a small unpacking/overhead cost.  This cost is generally speaking 
+quite insignificant, however it is best to avoid it whenever possible.  The remaining numpy functions that are dominantly 
+used are the np.random.choice, and np.random.dirichlet. 
+"""
+
 
 @njit
 def update_phi_col(signals_meaning_array, alpha_val, alpha_on_s,meaning_index,num_signals):
@@ -59,7 +104,6 @@ def update_phi_col(signals_meaning_array, alpha_val, alpha_on_s,meaning_index,nu
     return new_col
 
 
-
 @njit
 def update_signal_meaning(counts_array, lambda_val, meaning_index, signal_index, num_signals):
     """Update rule according to equation 14 in document Evolution of Communications Through Fluctuations"""
@@ -67,8 +111,6 @@ def update_signal_meaning(counts_array, lambda_val, meaning_index, signal_index,
         counts_array[i,meaning_index] = delta(i=signal_index, j=i) + (1-lambda_val)*counts_array[i,meaning_index]
     return counts_array
     
-    
-
 @njit
 def blind_success_inner_loop(agenti_phi,agentj_phi,num_signals,num_meanings):
     """I am defining the inner loop to be the sum over all meanings and signals of the selected agent's
@@ -94,28 +136,11 @@ def blind_success_outer_loop(num_agents,ensemble_phi,num_signals,num_meanings):
             if i==j:
                 continue
             else:
-                agenti_phi = ensemble_phi[i,:]
-                agentj_phi = ensemble_phi[j,:]
+                agenti_phi = ensemble_phi[i,:,:]
+                agentj_phi = ensemble_phi[j,:,:]
                 p_s += blind_success_inner_loop(agenti_phi,agentj_phi,num_signals,num_meanings)
     p_s*=const
     return p_s
-
-
-@njit
-def numba_random_choice(array,prob):
-    """Numba does not accept the probability distribution for the np.random.choice() function, as such we need a workaround to be able to handle 
-    this efficiently.  This function was taken from the numba support issue 2539, specifically from commentor Mike Fenton
-    
-    :param arr: A 1D numpy array of values to sample from.
-    :param prob: A 1D numpy array of probabilities for the given samples.
-    :return: A random sample from the given array with a given probability.
-
-    
-    """
-    return array[np.searchsorted(np.cumsum(prob), np.random.random(), side="right")]
-
-
-############################################################################################################################
 
 @njit
 def select_signal_integers_njit(alpha_dist, phi_array,meanings_integers,signals_integers):
@@ -175,10 +200,12 @@ def receive_signal_intergers_intergen_njit(signal_idx,passed_alpha_dist,phi_arra
     return nu_idx
 
 
-@njit
-def random_choice_test(upper,amount):
-    for _ in range(amount):
-        print(np.random.choice(upper,size = 2))
+"""End of numba core function section"""
+###############################################################
+"""Beginning of numba interaction dynamics section.  This section contains functions which guide/govern
+ the interactions for different ensemble domains i.e., single generation, multi-generation, mutli-generation
+ with an intergen alpha etc etc. More concretely: this section is the collection of functions from the previous 
+ section, put together in a nice wrapper, so that the actual calls within python stay nice and organized"""
 
 
 """The way I am handling the alpha tensor would make it difficult to make an optimal function for both intergen, 
@@ -219,9 +246,24 @@ def one_interaction_multiple_gens(counts,phi,speaker_info, meaning_integers, sig
     
     return phi,counts
 
+@njit
+def one_collection_loop_multiple_gens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations):
+    """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
+    for _ in range(iterations):
+        new_phi, new_counts = one_interaction_multiple_gens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S)
+        counts = new_counts
+        phi = new_phi
+
+    return phi, counts
+
+
+
+"""Intergen interactions"""
 @njit(nopython = True)
 def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S, alignment):
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S, intra_gen_alignment, intergen_alignment):
     speaker  = np.random.randint(num_agents)
     receiver = np.random.randint(num_agents - 1)
     if receiver >= speaker:
@@ -246,7 +288,7 @@ def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_i
         speaker_alpha = alpha_tensor[speaker_gen_tag,:]
         selected_signal_idx, rho_dist = select_signal_integers_njit(speaker_alpha,speaker_phi,meaning_integers,signal_integers)
 
-        if np.random.rand()<= alignment:
+        if np.random.rand()<= intra_gen_alignment:
             """Pass the rho distribution"""
             nu_idx = receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
 
@@ -261,7 +303,7 @@ def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_i
         """NOTE: Above will need to change as soon as dealing with more complex systems (i.e., more than 2 gens)"""
         selected_signal_idx, rho_dist = select_signal_integers_njit(intergen_alpha,speaker_phi,meaning_integers,signal_integers)
 
-        if np.random.rand() <= alignment:
+        if np.random.rand() <= intergen_alignment:
             """Pass rho dist"""
             nu_idx =receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
         else:
@@ -279,27 +321,13 @@ def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_i
     
     return phi,counts
 
-
-@njit
-def one_collection_loop_multiple_gens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations):
-    """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
-    for _ in range(iterations):
-        new_phi, new_counts = one_interaction_multiple_gens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S)
-        counts = new_counts
-        phi = new_phi
-
-    return phi, counts
-
-
 @njit
 def one_collection_loop_intergens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations, alignment):
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations, intra_gen_alignment, intergen_alignment):
     """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
     for _ in range(iterations):
         new_phi, new_counts = one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,alignment)
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,intra_gen_alignment,intergen_alignment)
         counts = new_counts
         phi = new_phi
 
@@ -354,14 +382,17 @@ def one_collection_loop_one_pop(counts,phi, meaning_integers, signal_integers,nu
 
     return phi, counts
 
-    
+
+
+"""End of interaction dynamics section"""
+###############################################################
 
 
 
 
 class Ensemble:
     def __init__(self,read_dir,output_dir, iterations, alignment,beta, alpha, num_signals, num_meanings, 
-                 lambda_val, time_resolution = 100000, import_agents = True, generation_overlap = False, 
+                 lambda_val, intergen_align , time_resolution = 100000, import_agents = True, generation_overlap = False, 
                  export_agents = False, new_gamma = None, passed_focuses = None, non_input_initialisation_agents = None):
         print("Initialising")
         self.param_dir = Path(read_dir)
@@ -371,6 +402,7 @@ class Ensemble:
 
 
         self.A = alignment
+        self.intergen_A = intergen_align
         self.beta = beta
         self.C = 1/(1+beta)
         self.lambda_val = lambda_val
@@ -383,6 +415,9 @@ class Ensemble:
         self.M = num_meanings
         self.meanings_integers = np.arange(num_meanings,dtype=int)
         self.signals_integers = np.arange(num_signals,dtype=int)
+
+        # self.gain_values = []
+        self.gain_epochs = []
 
         self.time_res = time_resolution
         self.tot_iterations = iterations
@@ -512,9 +547,6 @@ class Ensemble:
         """
         self.speaker_info[:,0] = int(self.num_gens)
         self.speaker_info[:,1] = self.imported_gens_lambda
-
-
-
 
     def create_initial_tensors(self, num_agents, passed_focuses = None):
         """Function to create the initial ensemble tensors at their base values, i.e., in the case of no imported agents"""
@@ -685,8 +717,22 @@ class Ensemble:
 
 
         if hasattr(self,"gain_values"):
+            """Only one set of gain values, corresponds to 1 gen case"""
             pd.DataFrame({"epoch": self.gain_epochs, "gain": self.gain_values}).to_csv(save_dir / "gain_values.csv",
                                                                                         index=False)
+
+
+
+###########################################################################################################################
+        """Number of gens is currently hardcoded into how the pandas file handles the data, in the future, it may be better
+        to shift this sort of thing into a numpy array, and use h5"""
+        if hasattr(self,"gens_gain"):
+            """Multiple generation gains, corresponds to system of multiple communicators"""
+            pd.DataFrame({"epoch": self.gain_epochs, "ensemble_gain": self.gens_gain[0], 
+                          "gen_0_gain":self.gens_gain[1],"gen_1_gain":self.gens_gain[2]}).to_csv(save_dir / "gen_gain_values.csv",
+                                                                                        index=False)
+###########################################################################################################################
+
 
         if idx_iter is not None:
             """If iteration is not none, we append the data we found to the h5py file we initialised earlier"""
@@ -728,6 +774,7 @@ class Ensemble:
                             'gamma':self.gamma,
                             'generation_focuses':self.gen_focuses,
                             'alignment':self.A,
+                            'Intergen_A':self.intergen_A,
                             'iterations':iterations,
                             'number_of_gens':self.num_gens,
                             'imported_file': self.param_dir,
@@ -768,6 +815,31 @@ class Ensemble:
         self.speaker_info = np.vstack((self.speaker_info,new_speaker_info))
         print(f"Debug, speaker info is {self.speaker_info}")
 
+    def measure_gen_gain(self, gen_gain_dict):
+        """Function to measure the gain for systems with more than one generation.  It is valueable to 
+        know how the ensemble gain differs compared to the individual populations 
+        
+        Ensemble data is always stored in the first dict list position, then generation data is stored in
+        increasing gen number order
+        """
+
+        keys = gen_gain_dict.keys()
+        num_gens = len(keys)-1
+        # print(f"Deug: num_gens is {num_gens}")
+                
+        p_s = blind_success_outer_loop(self.num_agents,self.population_phi,self.S,self.M)
+        gain = ((self.M*p_s) -1)/(self.S-1)
+        gen_gain_dict[0].append(gain)
+        start_iter = 0
+        for i in range(num_gens):
+            end_iter = self.avg_map[i]+start_iter
+            number_agents = end_iter-start_iter
+            generation_phi = self.population_phi[start_iter:end_iter,:,:]
+            p_s = blind_success_outer_loop(number_agents,generation_phi,self.S,self.M)
+            gain = ((self.M*p_s) -1)/(self.S-1)
+            gen_gain_dict[i+1].append(gain)
+            start_iter=end_iter
+
 
 #############################################################################################################################################
     def add_intergen_alpha(self,gen_0_weight = 0.5,gen_1_weight = 0.5):
@@ -801,10 +873,12 @@ class Ensemble:
 
         new_phi,new_counts = one_interaction_intergen(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                                    self.signals_integers,self.num_agents,dummy_alpha,self.M,
-                                                                   self.S,self.lambda_val,self.alpha,self.alpha_on_s, alignment =1.0)
+                                                                   self.S,self.lambda_val,self.alpha,self.alpha_on_s, 
+                                                                   intra_gen_alignment =1.0, intergen_alignment=1.0)
         new_phi,new_counts = one_collection_loop_intergens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
-                                                                           self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=2, alignment=1.0)
+                                                                           self.S,self.lambda_val,self.alpha, self.alpha_on_s, 
+                                                                           iterations=2, intra_gen_alignment=1.0,intergen_alignment=1.0)
         
     def one_interaction_one_pop_numba_test(self):
         print(f"Debug, testing one population numba tests")
@@ -821,7 +895,6 @@ class Ensemble:
         new_phi,new_counts = one_collection_loop_one_pop(dummy_counts,dummy_phi,self.meanings_integers,
                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
                                                            self.S,self.lambda_val,self.alpha,alpha_on_s=self.alpha_on_s,alignment=self.A, iterations=2)
-
 
     def training_loop_one_pop(self):
         print(f"Caching required numba functions")
@@ -845,6 +918,11 @@ class Ensemble:
             self.save_to_file(idx_iter=i)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
+            p_s = blind_success_outer_loop(self.num_agents,self.population_phi,self.S,self.M)
+            gain = ((self.M*p_s) -1)/(self.S-1)
+            self.gain_values.append(gain)
+            self.gain_epochs.append(((i+1) * self.time_res))
+
             print(f"Completed iteration {(i+1) * self.time_res}")
             assert np.allclose(self.population_phi.sum(axis=1), 1.0) #Check to make sure all the phi columns sum to 1
         
@@ -873,9 +951,15 @@ class Ensemble:
             self.save_agents_data()
 
         self.save_params(iterations = self.tot_iterations)
-        
-
+    
     def training_loop_intergen(self):
+
+
+        print(f"Debug: self.num_gens is {self.num_gens}")
+        self.gens_gain = {i:[] for i in range((self.num_gens+2))}
+        #+2 because we need to include ensemble data as well
+        print(f"Debug:self.gens_gains has keys {self.gens_gain.keys()}")
+
         print(f"Caching required numba functions")
         self.numba_warmup_intergen()
 
@@ -885,11 +969,21 @@ class Ensemble:
                                                                     self.population_phi,self.speaker_info,self.meanings_integers,
                                                                     self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
                                                                     self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=self.time_res, 
-                                                                    alignment = self.A)
-            self.save_to_file(idx_iter=i)
+                                                                    intra_gen_alignment = self.A, intergen_alignment=self.intergen_A)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
+            
+            
+            # p_s = blind_success_outer_loop(self.num_agents,self.population_phi,self.S,self.M)
+            # gain = ((self.M*p_s) -1)/(self.S-1)
+            # self.gain_values.append(gain)
+
+            self.measure_gen_gain(self.gens_gain)
+            # print(f"Debug:Self.gens_gain[0] looks like {self.gens_gain[0]}")
+
+            self.gain_epochs.append(((i+1) * self.time_res))
             print(f"Completed iteration {(i+1) * self.time_res}")
+            self.save_to_file(idx_iter=i)
             assert np.allclose(self.population_phi.sum(axis=1), 1.0) #Check to make sure all the phi columns sum to 1
         if self.export_agents:
             self.save_agents_data()
@@ -898,6 +992,7 @@ class Ensemble:
 
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--NumMeanings', type = int, help="Determines the numbers of meanings to be created/used in the case where meanings are not" \
     "hardcoded", default=12)
@@ -908,6 +1003,7 @@ if __name__ == "__main__":
     parser.add_argument('--Alpha', type = float, help="Determines the value of parameter alpha", default=0.1)
     parser.add_argument('--lambda_val', type = float, help="Determines the value of lambda, or the forgetting rate of the models", default=0.01)
     parser.add_argument('--alignment', type = float, help="Determines the alignment between models", default=1.0)
+    parser.add_argument('--GenAlign', type = float, help="Determines the alignment between models of different generations", default=0.50)
     parser.add_argument('--iterations', type=float, help = "Determines how many millions of iterations to run the code for", default = 4.0)
     parser.add_argument('--OutputDir', type = str, help = 'Determines the file output of saved plots, data, etc', 
                             default =str(Path.home()/"Downloads"/"MPhys/Code_Runs"))
@@ -937,7 +1033,7 @@ if __name__ == "__main__":
 
     
     debugging_ensemble = Ensemble(input_dir, output_directory, alignment=args.alignment, beta=args.Beta, alpha = args.Alpha,
-                                  lambda_val=args.lambda_val,num_meanings=args.NumMeanings,num_signals=args.NumSignals,
+                                  lambda_val=args.lambda_val,num_meanings=args.NumMeanings,num_signals=args.NumSignals,intergen_align=args.GenAlign,
                                    time_resolution=time_res, iterations=total_iterations, new_gamma=args.gamma, 
                                    passed_focuses=args.PassedFocuses, import_agents=args.Import, non_input_initialisation_agents=args.NumAgents,
                                    export_agents=args.Export)
