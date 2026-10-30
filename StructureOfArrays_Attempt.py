@@ -266,7 +266,8 @@ def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_i
                                   alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S, intra_gen_alignment, intergen_alignment):
     speaker  = np.random.randint(num_agents)
     receiver = np.random.randint(num_agents - 1)
-    if receiver >= speaker:
+    
+    if receiver == speaker:
         receiver += 1
 
     speaker_gen_tag = int(speaker_info[speaker,0])
@@ -899,6 +900,7 @@ class Ensemble:
     def training_loop_one_pop(self):
         print(f"Caching required numba functions")
         self.one_interaction_one_pop_numba_test()
+        self.gain_values = []
 
         """Need a check to collapse the alpha tensor into one vector if there are more than one alphas.  Logic for doing so is it 
         is easier to implement a check here, than to implement checks at every single instantiation of an agent/speaker group"""
@@ -953,6 +955,16 @@ class Ensemble:
         self.save_params(iterations = self.tot_iterations)
     
     def training_loop_intergen(self):
+
+        """Making a more explicit average map for the purposes of passing to the numba functions for better control over who interacts with whom"""
+
+        explicit_map = []
+        start_idx = 0
+        for z in range(len(self.avg_map)):
+            end_idx = self.avg_map[i]
+            explicit_map.append([start_idx,end_idx])
+            start_idx=end_idx
+
 
 
         print(f"Debug: self.num_gens is {self.num_gens}")
@@ -1047,7 +1059,7 @@ if __name__ == "__main__":
     # debugging_ensemble.training_loop_one_pop()
 
     debugging_ensemble.add_speakers(args.NumAgents,speakers_focuses=args.PassedFocuses)
-    # print(f"Debug: debugging_ensemble.gen_focuses is {debugging_ensemble.gen_focuses}")
+    # # print(f"Debug: debugging_ensemble.gen_focuses is {debugging_ensemble.gen_focuses}")
     debugging_ensemble.add_intergen_alpha(gen_0_weight=0.50, gen_1_weight= 0.50)
     debugging_ensemble.training_loop_intergen()
     # debugging_ensemble.training_loop_multiple_gens()
