@@ -1,17 +1,14 @@
-import numpy as np
-import scipy as sc
-import scipy.stats
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numba
-import ast
-from numba import njit, prange
 import argparse
-from pathlib import Path
-import pandas as pd
+import ast
 import json
-import h5py
 import time
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pandas as pd
+from numba import njit, types
+from numba.typed import Dict
 
 ###
 #Numba Section
@@ -261,44 +258,41 @@ def one_collection_loop_multiple_gens(counts,phi,speaker_info, meaning_integers,
 
 
 """Intergen interactions"""
+
 @njit(nopython = True)
 def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S, intra_gen_alignment, intergen_alignment):
-    speaker  = np.random.randint(num_agents)
-    receiver = np.random.randint(num_agents - 1)
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S, intra_gen_alignment, intergen_alignment,
+                                  gen_choice_arr, num_gens, gen_dict, intergen_prob):
+   
+
     
-    if receiver == speaker:
-        receiver += 1
-
-    speaker_gen_tag = int(speaker_info[speaker,0])
-    receiver_gen_tag = int(speaker_info[receiver,0])
-
-
-    speaker_phi = phi[speaker,:,:]
-    receiver_phi = phi[receiver,:,:]
-
-    receiver_counts = counts[receiver,:,:]
-
+    
     """If they are of the same population they pass their rho's with prob ~ alignment A, if they are of different generations, then BOTH 
     agents use the intergen alpha counts, however this is still passed with alignment A"""
 
 
-    if speaker_gen_tag==receiver_gen_tag:
-        """Same generation branch, we use the alpha from the speaker/receiver gen_tag, and pass the inst rho off with prob ~ Alignment"""
 
-        speaker_alpha = alpha_tensor[speaker_gen_tag,:]
-        selected_signal_idx, rho_dist = select_signal_integers_njit(speaker_alpha,speaker_phi,meaning_integers,signal_integers)
+    interaction_type_roll = np.random.rand()
+    if interaction_type_roll< intergen_prob:
+        """Intergen interaction, speaker (selected via the selected_speaker_gen) will communicate with a speaker from the opposite gen"""
 
-        if np.random.rand()<= intra_gen_alignment:
-            """Pass the rho distribution"""
-            nu_idx = receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
+        selected_agent_gens = np.random.randint(low = 0, high =(num_gens), size =2)
 
-        else:
-            """Receiver must create their own rho distribution"""
-            receiver_rho = np.random.dirichlet(alpha = speaker_alpha) #Can still reuse speaker alpha since they were same gen
-            nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
+        selected_speaker_gen = selected_agent_gens[0]
+        selected_receiver_gen = selected_agent_gens[1]
 
-    else:
+        speaker_arr = gen_dict[selected_speaker_gen]
+        speaker = np.random.choice(speaker_arr)
+
+        receiver_arr = gen_dict[selected_receiver_gen]
+        receiver = np.random.choice(receiver_arr)
+
+
+        speaker_phi = phi[speaker,:,:]
+        receiver_phi = phi[receiver,:,:]
+
+        receiver_counts = counts[receiver,:,:]
+
         """If the speaker and receiver do not have the same gen tag, then we must use the intergen alpha for both"""
         intergen_alpha = alpha_tensor[-1,:]
         """NOTE: Above will need to change as soon as dealing with more complex systems (i.e., more than 2 gens)"""
@@ -312,6 +306,34 @@ def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_i
             nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
 
 
+    else:
+        """Intragen interaction, need to select a speaker and receiver from the same generation"""
+        
+        selected_gen = np.random.randint(low = 0, high =(num_gens))
+
+        agent_arr = gen_dict[selected_gen]
+        speaker_receiver_idx = np.random.choice(agent_arr, size =2, replace = False)
+        speaker = speaker_receiver_idx[0]
+        receiver = speaker_receiver_idx[1]
+        speaker_gen_tag = int(speaker_info[speaker,0])
+
+        speaker_phi = phi[speaker,:,:]
+        receiver_phi = phi[receiver,:,:]
+
+        receiver_counts = counts[receiver,:,:]
+
+        """Same generation branch, we use the alpha from the speaker/receiver gen_tag, and pass the inst rho off with prob ~ Alignment"""
+        speaker_alpha = alpha_tensor[speaker_gen_tag,:]
+        selected_signal_idx, rho_dist = select_signal_integers_njit(speaker_alpha,speaker_phi,meaning_integers,signal_integers)
+
+        if np.random.rand()<= intra_gen_alignment:
+            """Pass the rho distribution"""
+            nu_idx = receive_signal_integers_njit(selected_signal_idx,rho_dist,receiver_phi,meaning_integers,M)
+
+        else:
+            """Receiver must create their own rho distribution"""
+            receiver_rho = np.random.dirichlet(alpha = speaker_alpha) #Can still reuse speaker alpha since they were same gen
+            nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
 
 
     """Updating the corresponding arrays"""
@@ -324,11 +346,16 @@ def one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_i
 
 @njit
 def one_collection_loop_intergens(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations, intra_gen_alignment, intergen_alignment):
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,iterations, intra_gen_alignment, intergen_alignment,
+                                  gen_maps, gen_dict, intergen_prob):
     """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
+
+    gen_num = gen_maps.shape[0]
+    gen_select_arr = np.arange(gen_num)
     for _ in range(iterations):
         new_phi, new_counts = one_interaction_intergen(counts,phi,speaker_info, meaning_integers, signal_integers,num_agents, 
-                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,intra_gen_alignment,intergen_alignment)
+                                  alpha_tensor,M, S, lambda_val,alpha_val,alpha_on_S,intra_gen_alignment,intergen_alignment,
+                                  gen_select_arr,gen_num,gen_dict, intergen_prob)
         counts = new_counts
         phi = new_phi
 
@@ -338,13 +365,20 @@ def one_collection_loop_intergens(counts,phi,speaker_info, meaning_integers, sig
 """Now doing the single generation interaction processes"""
 @njit
 def one_interaction_one_population(counts,phi, meaning_integers, signal_integers,num_agents,
-                                  alpha_vector,M, S, lambda_val,alpha_val,alpha_on_S, alignment):
+                                  alpha_vector,M, S,alpha_val,alpha_on_S, speaker_info):
     """Interaction rules for an ensemble of speakers all from one population"""
+
     
     speaker  = np.random.randint(num_agents)
     receiver = np.random.randint(num_agents - 1)
     if receiver >= speaker:
         receiver += 1
+
+    speaker_A = speaker_info[speaker,2]
+    receiver_A = speaker_info[receiver,2]
+
+    receiver_lambda = speaker_info[receiver,1]
+    avg_align = 0.5 * (speaker_A+receiver_A)
 
     speaker_phi = phi[speaker,:,:]
     receiver_phi = phi[receiver,:,:]
@@ -356,7 +390,7 @@ def one_interaction_one_population(counts,phi, meaning_integers, signal_integers
 
     #alignment rolls
     alignment_roll = np.random.random()
-    if alignment_roll<= alignment:
+    if alignment_roll<= avg_align:
         """If the roll is less than the specified value then pass the rho distribution, else reroll it"""
         receiver_rho = rho_dist
     else:
@@ -364,7 +398,7 @@ def one_interaction_one_population(counts,phi, meaning_integers, signal_integers
 
     nu_idx = receive_signal_integers_njit(selected_signal_idx,receiver_rho,receiver_phi,meaning_integers,M)
     """Updating the corresponding arrays"""
-    counts[receiver,:,:] = update_signal_meaning(receiver_counts,lambda_val,nu_idx,selected_signal_idx,S)
+    counts[receiver,:,:] = update_signal_meaning(receiver_counts,receiver_lambda,nu_idx,selected_signal_idx,S)
 
     new_phi_col = update_phi_col(counts[receiver,:,:],alpha_val,alpha_on_S,nu_idx,S)
     phi[receiver,:,nu_idx] = new_phi_col
@@ -373,11 +407,11 @@ def one_interaction_one_population(counts,phi, meaning_integers, signal_integers
 
 @njit
 def one_collection_loop_one_pop(counts,phi, meaning_integers, signal_integers,num_agents, 
-                                  alpha_vector,M, S, lambda_val,alpha_val,alpha_on_s, alignment,iterations):
+                                  alpha_vector,M, S,alpha_val,alpha_on_s, speaker_info,iterations):
     """Runs the data collection/communication process for a specified amount of iterations, then returns the counts and phi arrays"""
     for _ in range(iterations):
         new_phi, new_counts = one_interaction_one_population(counts,phi, meaning_integers, signal_integers,num_agents, 
-                                  alpha_vector,M, S, lambda_val,alpha_val,alpha_on_s, alignment)
+                                  alpha_vector,M, S,alpha_val,alpha_on_s, speaker_info)
         counts = new_counts
         phi = new_phi
 
@@ -394,7 +428,8 @@ def one_collection_loop_one_pop(counts,phi, meaning_integers, signal_integers,nu
 class Ensemble:
     def __init__(self,read_dir,output_dir, iterations, alignment,beta, alpha, num_signals, num_meanings, 
                  lambda_val, intergen_align , time_resolution = 100000, import_agents = True, generation_overlap = False, 
-                 export_agents = False, new_gamma = None, passed_focuses = None, non_input_initialisation_agents = None):
+                 export_agents = False, new_gamma = None, passed_focuses = None, non_input_initialisation_agents = None,
+                 nonuniformA = False, means = None, stds = None, weights = None):
         print("Initialising")
         self.param_dir = Path(read_dir)
         self.raw_dir = Path(read_dir)/"raw"
@@ -442,13 +477,23 @@ class Ensemble:
             assert self.imported_meanings== self.M, "Imported meanings and inputted meanings do not match"
             assert self.imported_signals== self.S, "Imported signals and inputted signals do not match"
             self.num_gens = len(self.imported_gen_focuses)-1
+
             self.create_initial_tensors_from_inputs(imported_focus_bool)
             # self.gen_focuses.append(self.imported_gen_focuses)
             print(f"Debug, self.speaker_info is {self.speaker_info}")
 
         else:
             self.num_gens =0
-            self.create_initial_tensors(num_agents=non_input_initialisation_agents, passed_focuses= passed_focuses)
+            if nonuniformA:
+                alignvec = self.generate_non_uniform_A(non_input_initialisation_agents,means,stds,weights)
+                print(f"Debug: alignvec is {alignvec}")
+                self.create_initial_tensors(num_agents=non_input_initialisation_agents, passed_focuses= passed_focuses, align_vec=alignvec)
+                #Save the dist information so we can create visuals of the plots 
+                self.means = means
+                self.stds = stds
+                self.weights = weights 
+            else:
+                self.create_initial_tensors(num_agents=non_input_initialisation_agents, passed_focuses= passed_focuses)
             print(f"Debug, self.speaker_info is {self.speaker_info}")
 
         """Debugging sections below while the code is still being made"""
@@ -510,7 +555,6 @@ class Ensemble:
         
         return gen_counts, selected_focuses
 
-
     #############################################################################################################################################
     def create_initial_tensors_from_inputs(self, focuses_bool):
         """Function to create the initial ensemble tensors from imported data"""
@@ -524,7 +568,7 @@ class Ensemble:
 
             #############################################################################################################################################
             if focuses_bool!= 0:
-                gen_counts, focuses = self.create_generation_focuses(2, supplied_focuses= self.imported_gen_focuses[0], gamma=self.imported_gamma)
+                gen_counts, _focuses = self.create_generation_focuses(2, supplied_focuses= self.imported_gen_focuses[0], gamma=self.imported_gamma)
                 self.alpha_tensor = np.array(gen_counts)
             else:
                 self.alpha_tensor = np.full((self.M), fill_value=(self.beta/self.M))
@@ -549,10 +593,10 @@ class Ensemble:
         self.speaker_info[:,0] = int(self.num_gens)
         self.speaker_info[:,1] = self.imported_gens_lambda
 
-    def create_initial_tensors(self, num_agents, passed_focuses = None):
+    def create_initial_tensors(self, num_agents, passed_focuses = None, align_vec = None):
         """Function to create the initial ensemble tensors at their base values, i.e., in the case of no imported agents"""
         if passed_focuses is not None:
-            gen_counts, selected_focuses = self.create_generation_focuses(number_focuses=2, supplied_focuses = passed_focuses)
+            gen_counts, _selected_focuses = self.create_generation_focuses(number_focuses=2, supplied_focuses = passed_focuses)
             self.alpha_tensor = np.array(gen_counts)
         else:
             self.alpha_tensor = np.full((self.M), fill_value=(self.beta/self.M))
@@ -571,9 +615,16 @@ class Ensemble:
         
         """
 
-        self.speaker_info = np.empty((num_agents, 2))
+        
+        self.speaker_info = np.empty((num_agents, 3))
         self.speaker_info[:,0] = int(self.num_gens)
         self.speaker_info[:,1] = self.lambda_val
+        
+        if align_vec is not None:
+            self.speaker_info[:,2] = align_vec
+        else:
+            self.speaker_info[:,2] = self.A
+
 
     def numba_warmup(self):
         test_array = np.array([0,1])
@@ -594,7 +645,7 @@ class Ensemble:
         numba_random_choice(test_array,test_array)
         
         print("Testing select_signal_integers_njit")
-        discard, rho_dist = select_signal_integers_njit(dummy_alpha,dummy_matrix,
+        _discard, rho_dist = select_signal_integers_njit(dummy_alpha,dummy_matrix,
                                     self.meanings_integers,self.signals_integers)
 
         print("Testing receive_signal_integers_njit")
@@ -766,22 +817,45 @@ class Ensemble:
         print("Agent data saved")
 
     def save_params(self,iterations):
-            params_dict = {'num_meanings': self.M,
-                        'num_signals': self.S,
-                        'num_agents': self.num_agents,
-                        'lambda':self.lambda_val,
-                            'alpha': self.alpha,
-                            'beta': self.beta,
-                            'gamma':self.gamma,
-                            'generation_focuses':self.gen_focuses,
-                            'alignment':self.A,
-                            'Intergen_A':self.intergen_A,
-                            'iterations':iterations,
-                            'number_of_gens':self.num_gens,
-                            'imported_file': self.param_dir,
-                            'avg_map': [float(x) for x in self.avg_map],
-                            'gen_alphas':  np.asarray(self.alpha_tensor).tolist(),
-            }
+            if hasattr(self,"means"):
+                params_dict = {'num_meanings': self.M,
+                            'num_signals': self.S,
+                            'num_agents': self.num_agents,
+                            'lambda':self.lambda_val,
+                                'alpha': self.alpha,
+                                'beta': self.beta,
+                                'gamma':self.gamma,
+                                'generation_focuses':self.gen_focuses,
+                                'alignment':self.A,
+                                'Intergen_A':self.intergen_A,
+                                'iterations':iterations,
+                                'number_of_gens':self.num_gens,
+                                'imported_file': self.param_dir,
+                                'avg_map': [float(x) for x in self.avg_map],
+                                'gen_alphas':  np.asarray(self.alpha_tensor).tolist(),
+                                'NUA_means': self.means,
+                                'NUA_stds': self.stds,
+                                'NUA_weights':self.weights,
+                                'NUA_AVec': self.speaker_info[:,2].tolist(),
+                                'Eta': self.eta
+                }
+            else:
+                params_dict = {'num_meanings': self.M,
+                            'num_signals': self.S,
+                            'num_agents': self.num_agents,
+                            'lambda':self.lambda_val,
+                                'alpha': self.alpha,
+                                'beta': self.beta,
+                                'gamma':self.gamma,
+                                'generation_focuses':self.gen_focuses,
+                                'alignment':self.A,
+                                'Intergen_A':self.intergen_A,
+                                'iterations':iterations,
+                                'number_of_gens':self.num_gens,
+                                'imported_file': self.param_dir,
+                                'avg_map': [float(x) for x in self.avg_map],
+                                'gen_alphas':  np.asarray(self.alpha_tensor).tolist()
+                }
             params_df = pd.DataFrame([params_dict])
             params_file = self.output_dir / "simulation_parameters.csv"
             params_df.to_csv(params_file, index=False)
@@ -801,7 +875,7 @@ class Ensemble:
         self.avg_map.append(speakers_added)
 
         if speakers_focuses is not None:
-            gen_counts, selected_focuses = self.create_generation_focuses(number_focuses=2, supplied_focuses = speakers_focuses)
+            gen_counts, _selected_focuses = self.create_generation_focuses(number_focuses=2, supplied_focuses = speakers_focuses)
             # self.gen_focuses.append(selected_focuses)
             new_alpha = np.array(gen_counts)
         else:
@@ -815,6 +889,23 @@ class Ensemble:
         print(f"Debug, new speaker info is {new_speaker_info}")
         self.speaker_info = np.vstack((self.speaker_info,new_speaker_info))
         print(f"Debug, speaker info is {self.speaker_info}")
+
+    def generate_non_uniform_A(self,N,means,stds,weights):
+        """Generates N samples from a bimodal distribution (with even weighting), as described by mu1 sigma1, and mu2 sigma2.
+        Means and stds should be passed as an array or list object
+        """
+        assert np.array(weights).sum() +1e-5 >=1.0, "Weights do not sum to 1"
+        num_choices = len(means)
+        components = np.random.choice(num_choices, size = N, p =weights)
+        samples = np.random.normal(np.take(means,components), np.take(stds,components)) #vectorises the pull so faster for large N
+
+        self.eta = (np.array(means) *np.array(weights)).sum()#Define our parameter eta to be the weighted sum of bimodal dist
+    
+        filtered_samples = np.where(samples>=1.0,1.0,samples)#Filter out any samples where alignment >= 1, set it equal to 1 directly
+
+        
+
+        return filtered_samples
 
     def measure_gen_gain(self, gen_gain_dict):
         """Function to measure the gain for systems with more than one generation.  It is valueable to 
@@ -855,34 +946,37 @@ class Ensemble:
         dummy_alpha  = np.full(shape=(self.num_gens+1,self.M), fill_value=self.beta/self.M)
 
         
-        print(f"Debug, testing one interaction numba")
+        print("Debug, testing one interaction numba")
         new_phi,new_counts = one_interaction_multiple_gens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
                                                            self.S,self.lambda_val,self.alpha,self.alpha_on_s)
-        print(f"Debug, testing one data loop numba")
+        print("Debug, testing one data loop numba")
         new_phi,new_counts = one_collection_loop_multiple_gens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
                                                                            self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=2)
     
-    def numba_warmup_intergen(self):
-        print(f"Performing numba warmups for intergen")
+    def numba_warmup_intergen(self,gen_dict, gen_choice):
+        print("Performing numba warmups for intergen")
         dummy_counts = np.zeros((self.num_agents,self.S, self.M))
         dummy_phi    = np.full((self.num_agents,self.S, self.M), 1.0/self.S)
         dummy_alpha  = np.full(shape=(self.num_gens+1,self.M), fill_value=self.beta/self.M)
         # print(f"Debug : numba_warmup_intergen : dummy alpha is {dummy_alpha}")
 
-
         new_phi,new_counts = one_interaction_intergen(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                                    self.signals_integers,self.num_agents,dummy_alpha,self.M,
                                                                    self.S,self.lambda_val,self.alpha,self.alpha_on_s, 
-                                                                   intra_gen_alignment =1.0, intergen_alignment=1.0)
+                                                                   intra_gen_alignment =1.0, intergen_alignment=1.0,
+                                                                   gen_choice_arr=gen_choice,num_gens=1,gen_dict=gen_dict,
+                                                                   intergen_prob = 0.0)
         new_phi,new_counts = one_collection_loop_intergens(dummy_counts,dummy_phi,self.speaker_info,self.meanings_integers,
                                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
                                                                            self.S,self.lambda_val,self.alpha, self.alpha_on_s, 
-                                                                           iterations=2, intra_gen_alignment=1.0,intergen_alignment=1.0)
+                                                                           iterations=2, intra_gen_alignment=1.0,intergen_alignment=1.0,
+                                                                            gen_maps=gen_choice,gen_dict=gen_dict,
+                                                                   intergen_prob = 0.0)
         
     def one_interaction_one_pop_numba_test(self):
-        print(f"Debug, testing one population numba tests")
+        print("Debug, testing one population numba tests")
         dummy_counts = np.zeros((self.num_agents,self.S, self.M))
         dummy_phi    = np.full((self.num_agents,self.S, self.M), 1.0/self.S)
         dummy_alpha  = np.full(shape=(self.M), fill_value=self.beta/self.M)
@@ -890,15 +984,15 @@ class Ensemble:
 
         newphi,new_counts = one_interaction_one_population(dummy_counts,dummy_phi,self.meanings_integers,
                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
-                                                           self.S,self.lambda_val,alpha_val=self.alpha,alpha_on_S=self.alpha_on_s,alignment=self.A)
+                                                           self.S,alpha_val=self.alpha,alpha_on_S=self.alpha_on_s,speaker_info=self.speaker_info)
 
-        print(f"Testing training loop")
+        print("Testing training loop")
         new_phi,new_counts = one_collection_loop_one_pop(dummy_counts,dummy_phi,self.meanings_integers,
                                                            self.signals_integers,self.num_agents,dummy_alpha,self.M,
-                                                           self.S,self.lambda_val,self.alpha,alpha_on_s=self.alpha_on_s,alignment=self.A, iterations=2)
+                                                           self.S,self.alpha,alpha_on_s=self.alpha_on_s,speaker_info=self.speaker_info, iterations=2)
 
     def training_loop_one_pop(self):
-        print(f"Caching required numba functions")
+        print("Caching required numba functions")
         self.one_interaction_one_pop_numba_test()
         self.gain_values = []
 
@@ -915,15 +1009,15 @@ class Ensemble:
             new_population_phi, new_population_counts = one_collection_loop_one_pop(self.population_counts,
                                                                     self.population_phi,self.meanings_integers,
                                                                    self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
-                                                                   self.S,self.lambda_val,self.alpha,alpha_on_s=self.alpha_on_s,
-                                                                   alignment=self.A, iterations=self.time_res)
+                                                                   self.S,self.alpha,alpha_on_s=self.alpha_on_s,
+                                                                   speaker_info=self.speaker_info, iterations=self.time_res)
             self.save_to_file(idx_iter=i)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
             p_s = blind_success_outer_loop(self.num_agents,self.population_phi,self.S,self.M)
             gain = ((self.M*p_s) -1)/(self.S-1)
             self.gain_values.append(gain)
-            self.gain_epochs.append(((i+1) * self.time_res))
+            self.gain_epochs.append((i+1) * self.time_res)
 
             print(f"Completed iteration {(i+1) * self.time_res}")
             assert np.allclose(self.population_phi.sum(axis=1), 1.0) #Check to make sure all the phi columns sum to 1
@@ -934,7 +1028,7 @@ class Ensemble:
         self.save_params(iterations = self.tot_iterations)
 
     def training_loop_multiple_gens(self):
-        print(f"Caching required numba functions")
+        print("Caching required numba functions")
         self.numba_warmup_multiple_gens()
 
         self.generate_initial_h5_file()
@@ -954,26 +1048,43 @@ class Ensemble:
 
         self.save_params(iterations = self.tot_iterations)
     
-    def training_loop_intergen(self):
+    def training_loop_intergen(self, intergen_prob):
 
-        """Making a more explicit average map for the purposes of passing to the numba functions for better control over who interacts with whom"""
 
-        explicit_map = []
+        
+        """Making a more explicit average map for the purposes of passing to the numba functions for better control over who interacts with whom
+        Note this is being more or less hardcoded, in future 
+        """
+
+        explicit_map = np.empty((len(self.avg_map),2),dtype = np.int64)
+        gen_dict = Dict.empty(key_type = types.int64, value_type = types.int64[:])
         start_idx = 0
+        print(f"Debug: len(self.avg_map) is {len(self.avg_map)}")
         for z in range(len(self.avg_map)):
-            end_idx = self.avg_map[i]
-            explicit_map.append([start_idx,end_idx])
-            start_idx=end_idx
+            end_idx = self.avg_map[z]
+            end_val = start_idx+end_idx
+            # explicit_map.append([start_idx,end_val])
+            explicit_map[z,0] = start_idx
+            explicit_map[z,1] = end_val
+            gen_dict[z] = np.arange(start_idx,end_val)
+            start_idx=end_val
+
+        print(f"Debug: Explicit map is {explicit_map}")
+        print(f"Debug: Gen Dict is {gen_dict}")
+            
 
 
 
         print(f"Debug: self.num_gens is {self.num_gens}")
-        self.gens_gain = {i:[] for i in range((self.num_gens+2))}
+        self.gens_gain = {i:[] for i in range(self.num_gens+2)}
         #+2 because we need to include ensemble data as well
         print(f"Debug:self.gens_gains has keys {self.gens_gain.keys()}")
 
-        print(f"Caching required numba functions")
-        self.numba_warmup_intergen()
+        print("Caching required numba functions")
+        inst_gen_choice = np.arange(len(self.avg_map))
+        print(f"Debug inst_gen_choice is {inst_gen_choice}")
+        self.numba_warmup_intergen(gen_dict=gen_dict,gen_choice =inst_gen_choice )
+        
 
         self.generate_initial_h5_file()
         for i in range(self.num_measurements):
@@ -981,7 +1092,8 @@ class Ensemble:
                                                                     self.population_phi,self.speaker_info,self.meanings_integers,
                                                                     self.signals_integers,self.num_agents,self.alpha_tensor,self.M,
                                                                     self.S,self.lambda_val,self.alpha, self.alpha_on_s, iterations=self.time_res, 
-                                                                    intra_gen_alignment = self.A, intergen_alignment=self.intergen_A)
+                                                                    intra_gen_alignment = self.A, intergen_alignment=self.intergen_A, 
+                                                                    gen_maps = explicit_map, gen_dict = gen_dict, intergen_prob = intergen_prob)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
             
@@ -993,7 +1105,7 @@ class Ensemble:
             self.measure_gen_gain(self.gens_gain)
             # print(f"Debug:Self.gens_gain[0] looks like {self.gens_gain[0]}")
 
-            self.gain_epochs.append(((i+1) * self.time_res))
+            self.gain_epochs.append((i+1) * self.time_res)
             print(f"Completed iteration {(i+1) * self.time_res}")
             self.save_to_file(idx_iter=i)
             assert np.allclose(self.population_phi.sum(axis=1), 1.0) #Check to make sure all the phi columns sum to 1
@@ -1016,6 +1128,8 @@ if __name__ == "__main__":
     parser.add_argument('--lambda_val', type = float, help="Determines the value of lambda, or the forgetting rate of the models", default=0.01)
     parser.add_argument('--alignment', type = float, help="Determines the alignment between models", default=1.0)
     parser.add_argument('--GenAlign', type = float, help="Determines the alignment between models of different generations", default=0.50)
+    parser.add_argument('--IntergenProb', type = float, help="Determines the frequency of intergen interactions", default=0.50)
+
     parser.add_argument('--iterations', type=float, help = "Determines how many millions of iterations to run the code for", default = 4.0)
     parser.add_argument('--OutputDir', type = str, help = 'Determines the file output of saved plots, data, etc', 
                             default =str(Path.home()/"Downloads"/"MPhys/Code_Runs"))
@@ -1030,6 +1144,13 @@ if __name__ == "__main__":
     parser.add_argument('--TimeRes', type = float, help="Determines how often to collect data, in multipliers of 1 hundred thousand", default = 1.0)
     parser.add_argument('--Export', action='store_true', help='If set, exports the agents')
     parser.add_argument('--Import', action='store_true', help='If set, lets us import agents')
+    parser.add_argument('--Means', type = float,nargs='+', help ="If given inputs, sets the means for the bimodal distribution " \
+    "that alignments are drawn from in the non-uniform alignment case", default = None)
+    parser.add_argument('--Stds', type = float,nargs='+', help ="If given inputs, sets the stds for the bimodal distribution " \
+    "that alignments are drawn from in the non-uniform alignment case", default = None)
+    parser.add_argument('--Ws', type = float,nargs='+', help ="If given inputs, sets the weights for the bimodal distribution " \
+    "that alignments are drawn from in the non-uniform alignment case", default = None)
+    parser.add_argument('--NonUniform', action='store_true', help='If set, we use non_uniform alignments')
 
     args = parser.parse_args()
 
@@ -1048,7 +1169,7 @@ if __name__ == "__main__":
                                   lambda_val=args.lambda_val,num_meanings=args.NumMeanings,num_signals=args.NumSignals,intergen_align=args.GenAlign,
                                    time_resolution=time_res, iterations=total_iterations, new_gamma=args.gamma, 
                                    passed_focuses=args.PassedFocuses, import_agents=args.Import, non_input_initialisation_agents=args.NumAgents,
-                                   export_agents=args.Export)
+                                   nonuniformA=args.NonUniform, export_agents=args.Export, means=args.Means,stds=args.Stds,weights=args.Ws)
     
     
     
@@ -1056,13 +1177,12 @@ if __name__ == "__main__":
     # debugging_ensemble.generate_initial_h5_file()
     # print(f"Debug Shape of intergen_tensor = {debugging_ensemble.inter_gen_alpha.shape}, and is {debugging_ensemble.inter_gen_alpha}")
     train_start_time = time.time()
-    # debugging_ensemble.training_loop_one_pop()
+    debugging_ensemble.training_loop_one_pop()
 
-    debugging_ensemble.add_speakers(args.NumAgents,speakers_focuses=args.PassedFocuses)
-    # # print(f"Debug: debugging_ensemble.gen_focuses is {debugging_ensemble.gen_focuses}")
-    debugging_ensemble.add_intergen_alpha(gen_0_weight=0.50, gen_1_weight= 0.50)
-    debugging_ensemble.training_loop_intergen()
-    # debugging_ensemble.training_loop_multiple_gens()
+    # debugging_ensemble.add_speakers(args.NumAgents,speakers_focuses=args.PassedFocuses)
+    # print(f"Debug: debugging_ensemble.gen_focuses is {debugging_ensemble.gen_focuses}")
+    # debugging_ensemble.add_intergen_alpha(gen_0_weight=0.50, gen_1_weight= 0.50)
+    # debugging_ensemble.training_loop_intergen(0.0)
 
 
     train_end_time = time.time()
