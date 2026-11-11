@@ -1,22 +1,20 @@
-import numpy as np
-import scipy as sc
-import scipy.stats
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-import seaborn as sns
-import numba
-from numba import njit, prange
 import argparse
-from pathlib import Path
-import pandas as pd
-import json
-import h5py
-from functools import partial
 import ast
+from functools import partial
+from pathlib import Path
+
+import h5py
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+import pandas as pd
+import scipy.stats
+import seaborn as sns
+from matplotlib import animation
 
 
 class File_Interpreter:
-    def __init__(self, raw_dir, save_fig,show_fig,save_dir,fps, gens= False):
+    def __init__(self, raw_dir, save_fig,show_fig,save_dir,fps, gens= False,NonUniform = False):
         self.read_dir = Path(raw_dir)
         self.read_raw_dir = self.read_dir/"raw"
         self.save_dir = Path(save_dir)
@@ -24,12 +22,15 @@ class File_Interpreter:
         self.save = save_fig
         self.fps = fps
 
-
         if gens:
             self.read_param_file_gens()
         else:
             self.read_param_file()
-        
+
+        if NonUniform:
+            self.read_param_fileNUA()
+
+
         self.gen_colors = ["red","blue","green"]
         #This is hardcoded, so obviously not ideal, but I doubt I will ever need more than 3 gens per plots
 
@@ -45,14 +46,14 @@ class File_Interpreter:
         self.beta = params_df['beta'][0]
         self.gamma = params_df['gamma'][0]
         self.gen_focuses = params_df['generation_focuses'].apply(ast.literal_eval)[0]
+        self.num_gens = params_df['number_of_gens'][0]+1
         print(f"Generation focuses are {self.gen_focuses}")
-        self.num_gens = len(self.gen_focuses)
+        
         
         self.A = params_df['alignment'][0]
         #Need the extra handling to convert the csv's string back into an actual python list
-        self.certainty = params_df['certainty'][0]
 
-        self.avgs_map = params_df['avg_map'].apply(ast.literal_eval)[0]
+        self.avgs_map = params_df['avg_map'].apply(ast.literal_eval)
         print(f"Averages map is {self.avgs_map}")
 
 
@@ -78,7 +79,27 @@ class File_Interpreter:
         
         self.A = params_df['alignment'][0]
         #Need the extra handling to convert the csv's string back into an actual python list
-        self.certainty = params_df['certainty'][0]
+
+    def read_param_fileNUA(self):
+        """Reads the inputted parameter.csv file and updates/records the relevant ensemble parameter values accordingly"""
+        params_df = pd.read_csv(self.read_dir/"simulation_parameters.csv")
+        self.num_meanings = params_df['num_meanings'][0]
+        # print(self.num_meanings)
+        self.num_signals = params_df['num_signals'][0]
+        self.num_imported_agents = params_df['num_agents'][0]
+        self.imported_gens_lambda = params_df['lambda'][0]
+        self.beta = params_df['beta'][0]
+        self.gamma = params_df['gamma'][0]
+        self.gen_focuses = params_df['generation_focuses'].apply(ast.literal_eval)[0]
+        self.num_gens = len(self.gen_focuses)
+        
+        self.A_vec = params_df["NUA_AVec"].apply(ast.literal_eval)[0]
+        print(f"Debug: read A_vec is {self.A_vec}")
+        self.nua_means = params_df["NUA_means"].apply(ast.literal_eval)[0]
+        self.nua_stds = params_df["NUA_stds"].apply(ast.literal_eval)[0]
+        self.nua_weights = params_df["NUA_weights"].apply(ast.literal_eval)[0]
+        #Need the extra handling to convert the csv's string back into an actual python list
+
 
     def plot_save_or_show(self, fig, name):
         """A helper function to be called after creating a figure in any of the below functions.  Determines what to do with the created figure"""
@@ -114,7 +135,23 @@ class File_Interpreter:
                         label.set_color(self.gen_colors[gen])
                         label.set_fontweight("bold")
 
-    def plot_dirichlet_dists(self,num_toys):
+    def plot_NUA_dists(self,samples):
+        """Creates plots of the bimodal NUA distributions for visual inspection"""
+        print(f"Debug: means {self.nua_means}, stds {self.nua_stds}, weights {self.nua_weights}")
+        num_choices = len(self.nua_means)
+        components = np.random.choice(num_choices, size = samples, p =self.nua_weights)
+        samples = np.random.normal(np.take(self.nua_means,components), np.take(self.nua_stds,components)) #vectorises the pull so faster for large N
+        fig, ax = plt.subplots(figsize = (10,6))
+        ax.hist(samples, bins = 20)
+        ax.set_xlabel("Alignment")
+        ax.set_ylabel("Counts")
+        ax.set_title(f"Histogram of {len(samples)} draws from bimodal distribution")
+        title= "NUA"
+        self.plot_save_or_show(fig,title)
+
+        
+
+    def plot_dirichlet_dists(self,num_samples):
         len_alpha = len(self.gen_alphas[0])
         meanings = np.arange(len_alpha)
         
@@ -122,21 +159,43 @@ class File_Interpreter:
             
             inst_alpha = self.gen_alphas[i]
             arr = np.full(shape = len_alpha, fill_value=inst_alpha)
-            dirichlet_samples = scipy.stats.dirichlet.rvs(arr, size = num_toys)
+            dirichlet_samples = scipy.stats.dirichlet.rvs(arr, size = num_samples)
+
+            magnified_samples = dirichlet_samples*100
+
             print(f"Shape of dirichlet samples is {dirichlet_samples.shape}")
-            avg = dirichlet_samples.mean(axis = 0)
-            print(f"Dirichlet sample average is {avg}")
 
-            magnified_counts = (100*avg).astype(int)
-            print(magnified_counts)
+            fig, axes = plt.subplots(nrows = 2, ncols =4, figsize =(16,8), layout = "constrained")
+            axes = axes.flatten()
+            for k, ax in enumerate(axes):
+                ax.bar(meanings,magnified_samples[k,:],width = 0.8, edgecolor = 'black')
+                ax.set_xticks(meanings) 
+                ax.set_xlabel("Meanings")
+                ax.set_ylabel("100x Attention Draw")
 
-            fig,ax = plt.subplots(figsize =(10,6))
-            ax.bar(meanings,magnified_counts,width = 0.8, edgecolor = 'black')
-            ax.set_ylabel("100x Average Attention Prob")
-            ax.set_xticks(meanings)
-            ax.set_xlabel(f"Meaning")
-            ax.set_title(f"Average of {num_toys} Dirichlet Draws Multiplied by 100")
+            fig.suptitle(f"Magnified Dirichlet Draws for Generation {i}")
+
             self.plot_save_or_show(fig,name = f"gen_{i}_dirichlet_visual")
+
+        """Now doing the intergen attentional focuses"""
+        
+        intergen_alphas = self.gen_alphas[-1]
+        arr = np.full(shape = len_alpha, fill_value=intergen_alphas)
+        dirichlet_samples = scipy.stats.dirichlet.rvs(arr, size = num_samples)
+
+        magnified_samples = dirichlet_samples*100
+
+        print(f"Shape of dirichlet samples is {dirichlet_samples.shape}")
+
+        fig, axes = plt.subplots(nrows = 2, ncols =4, figsize =(16,8), layout = "constrained")
+        axes = axes.flatten()
+        for k, ax in enumerate(axes):
+            ax.bar(meanings,magnified_samples[k,:],width = 0.8, edgecolor = 'black')
+            ax.set_xticks(meanings) 
+            ax.set_xlabel("Meanings")
+            ax.set_ylabel("100x Attention Draw")
+        fig.suptitle("Magnified Dirichlet Draws for Intergen Attentional Focus")
+        self.plot_save_or_show(fig,name = "intergen_dirichlet_visual")
 
     def plot_final_phi(self, highlight_focuses = True):
         with h5py.File(self.read_raw_dir/"array_data.h5", 'r') as f:
@@ -148,12 +207,39 @@ class File_Interpreter:
             ax.set_xlabel("Meaning")
             ax.set_ylabel("Signal")
             self.highlight_focuses(ax,highlights=self.highlight_focuses)
-            name = f"Final_Phi"
+            name = "Final_Phi"
             self.plot_save_or_show(fig,name)
-    
+        f.close()
+
+    def plot_final_phi_gens(self, highlight_focuses = True):
+        """Currently hardcoded to only work with two generations, for further generations, more flexible methodology is needed"""
+        fig, (ax1,ax2) = plt.subplots(nrows=1, ncols=2,figsize = (18,9))
+        with h5py.File(self.read_raw_dir/"array_data.h5", 'r') as f:
+            ensemble_array= f['Phi']['phi_gens_dataset']
+            print(f"Shape of the ensemble array is {ensemble_array.shape}")
+
+            phi_array = f['Phi']['phi_gens_dataset'][:,0,:,:]
+            final_count = phi_array[-1,:,:]
+            sns.heatmap(final_count,ax = ax1,cmap = 'coolwarm',vmax = 1.0)
+            ax1.set_xlabel("Meanings")
+            ax1.set_ylabel("Signals")
+            ax1.set_title("Generation 0")    
+            self.highlight_focuses(ax1,gen = 0)
+
+            final_phi_2_array =f['Phi']['phi_gens_dataset'][-1,1,:,:] 
+            sns.heatmap(final_phi_2_array,ax = ax2,cmap = 'coolwarm',vmax =1.0)
+            ax2.set_xlabel("Meanings")
+            ax2.set_ylabel("Signals")
+            ax2.set_title("Generation 1")    
+            self.highlight_focuses(ax2,gen = 1)
+
+            name = "Final_Phi_Both_Gens"
+            self.plot_save_or_show(fig,name)
+
+
     def plot_final_counts(self, highlight_focuses = True):
         with h5py.File(self.read_raw_dir/"array_data.h5", 'r') as f:
-            final_count = f['signal_meaning']['signal_meanings_dataset'][-1,:,:]
+            final_count = f['counts']['counts_dataset'][-1,:,:]
             print(f"final_count max and min vals are {np.max(final_count)} {np.min(final_count)}")
             fig,ax = plt.subplots(figsize = (10,8))
             sns.heatmap(final_count,cmap = 'coolwarm')
@@ -161,8 +247,51 @@ class File_Interpreter:
             ax.set_xlabel("Meaning")
             ax.set_ylabel("Signal")
             self.highlight_focuses(ax,highlights=self.highlight_focuses)
-            name = f"Final_Counts"
+            name = "Final_Counts"
             self.plot_save_or_show(fig,name)
+
+    def plot_gain(self):
+        """Plotter function to plot the gain functions"""
+        gain_df = pd.read_csv(self.read_raw_dir/"gain_values.csv")
+        gain_vals = gain_df['gain']
+        print(f"Debug: gain vals have length {len(gain_vals)}")
+
+        
+        epochs = gain_df['epoch']
+        print(f"Debug: Gain epochs has leng {len(epochs)}")
+        fig, ax = plt.subplots(figsize = (10,8))
+        ax.plot(epochs,gain_vals)
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Communication Gain")
+        ax.set_title("Communication Gain vs Iterations")
+        name = "Gain"
+        self.plot_save_or_show(fig,name)
+        ax.set_yscale('log')
+        name = "Log_Gain"
+        self.plot_save_or_show(fig,name)
+
+    def plot_gain_gens(self):
+        """Simulation runs with generations will save the gain values to a 
+        dict as opposed to a list, as such a separate function is necessary"""
+        gain_df = pd.read_csv(self.read_raw_dir/"gen_gain_values.csv")
+        ensemble_gain = gain_df['ensemble_gain']
+        gen_0_gain = gain_df['gen_0_gain']
+        gen_1_gain = gain_df['gen_1_gain']
+        gain_epochs = gain_df['epoch']
+
+        fig, ax = plt.subplots(figsize = (10,8))
+        ax.plot(gain_epochs,ensemble_gain, label = "Ensemble")
+        ax.plot(gain_epochs,gen_0_gain, label = "Gen 0")
+        ax.plot(gain_epochs,gen_1_gain, label = "Gen 1")
+        ax.legend()
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Communication Gain")
+        ax.set_title("Communication Gain vs Iterations")
+        name = "Gen_Gain"
+        self.plot_save_or_show(fig,name)
+
+
+
 
     def animate_phi(self):
         with h5py.File(self.read_raw_dir/"array_data.h5", 'r') as f:
@@ -176,7 +305,7 @@ class File_Interpreter:
             ax.set_xlabel("Meanings")
             ax.set_ylabel("Signal")
             fig.colorbar(im, ax = ax)
-            ax.set_title(f"Ensemble Phi Array")
+            ax.set_title("Ensemble Phi Array")
 
             ax.set_xticks(np.arange(self.num_meanings))
             #Need to set the number of x ticks to be exactly the number of possible x vals, otherwise the highlighter won't work 
@@ -235,7 +364,7 @@ class File_Interpreter:
         with h5py.File(self.read_raw_dir/"array_data.h5", 'r') as f:
                     
             
-            counts_array = f['signal_meaning']['signal_meanings_dataset'][:,:,:]
+            counts_array = f['counts']['counts_dataset'][:,:,:]
             print(f"Ensemble counts array is of shape {counts_array.shape}")
             num_frames = counts_array.shape[0]
             fig,ax = plt.subplots(figsize = (10,8))
@@ -243,7 +372,7 @@ class File_Interpreter:
             ax.set_xlabel("Meanings")
             ax.set_ylabel("Signal")
             fig.colorbar(im, ax = ax)
-            ax.set_title(f"Ensemble Counts Array")
+            ax.set_title("Ensemble Counts Array")
             ax.set_xticks(np.arange(self.num_meanings))
             self.highlight_focuses(ax,highlights=self.highlight_focuses)
  
@@ -257,7 +386,37 @@ class File_Interpreter:
             name = "Counts_animation"
             self.anim_save_or_show(fig,anim,name)
 
+    def generate_nx_plot(self):
+        """Generates a plot of the network using networkx, where connections between graph nodes 
+        represent the strength (magnitude) of the alignment in the given interaction.  The procedure 
+        for generating the alignment matrix allows values along diagonal (i.e., a self interaction
+        which is not possible), thus we need to manually remove these values """
 
+        alignment_matrix = np.load(self.read_dir/"align_matrix.npy")
+        np.fill_diagonal(alignment_matrix,0.0) #all main diagonal elements are 0 so as to neglect self interaction
+
+        scaled_alignment  = alignment_matrix #scale values up so difference on plots actually shows up
+        # G=nx.DiGraph()
+        G = nx.from_numpy_array(scaled_alignment)
+
+        #If want non-symmetric Alignment matrix use the following
+        # G = nx.from_numpy_array(scaled_alignment, create_using=nx.DiGraph)
+
+        alignments_flattened  = [scaled_alignment[i,j] for i,j in G.edges()]
+
+        pos = nx.spring_layout(G, weight="weight")
+        
+
+        fig, ax = plt.subplots(figsize = (10,6))
+        nx.draw_networkx_nodes(G,pos = pos, node_color = 'lightblue', ax=ax)
+        nx.draw_networkx_labels(G, pos = pos, ax=ax)
+        nx.draw_networkx_edges(G,pos = pos,width = alignments_flattened,edge_color=alignments_flattened, 
+                               edge_cmap=plt.cm.coolwarm,ax=ax,arrows=True, connectionstyle="arc3,rad=0.15") 
+        #connection style curves lines a bit--> easier to spot alignment in each direction
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.coolwarm, norm=plt.Normalize(0, 1))
+        fig.colorbar(sm, ax=ax, label="Alignment")
+        
+        self.plot_save_or_show(fig,name = "Network")
 
 if __name__ =="__main__":
     parser = argparse.ArgumentParser()
@@ -270,6 +429,10 @@ if __name__ =="__main__":
     parser.add_argument('--ShowFig', action='store_true', help='If set, shows figures')
     parser.add_argument('--fps', type = int, help = "Determines the frames per second on videos", default =10)
     parser.add_argument('--Gens', action='store_true', help='If set, determines which parameter file reading to do')
+    parser.add_argument('--NonUniform', action='store_true', help='If set, determines which parameter file reading to do')
+    parser.add_argument('--Samples', type = int, help = "Determines the number of samples to draw for the bimodal distribution", default =1000)
+
+
     args = parser.parse_args()
 
     
@@ -277,17 +440,28 @@ if __name__ =="__main__":
     output_directory.mkdir(parents = True, exist_ok = True)#Creates the folder if it does not already exist
     read_directory = output_directory
 
-    Plotter = File_Interpreter(read_directory,args.SaveFig,args.ShowFig,output_directory, args.fps, args.Gens)
+    Plotter = File_Interpreter(read_directory,args.SaveFig,args.ShowFig,output_directory, args.fps, args.Gens,args.NonUniform)
 
-    if args.Gens:
-        Plotter.plot_final_phi()
-        Plotter.plot_final_counts()
-        Plotter.animate_phi_gens()
-        Plotter.animate_counts()
-        Plotter.animate_phi()
-        Plotter.plot_dirichlet_dists(num_toys=100)
-    else:
-        Plotter.plot_final_phi()
-        Plotter.plot_final_counts()
-        Plotter.animate_counts()
-        Plotter.animate_phi()
+    # if args.Gens:
+    #     Plotter.plot_final_phi()
+    #     Plotter.plot_final_counts()
+    #     Plotter.animate_phi_gens()
+    #     Plotter.animate_counts()    
+    #     Plotter.animate_phi()
+    #     Plotter.plot_dirichlet_dists(num_samples=8)
+        
+    #     Plotter.plot_gain_gens()
+    #     # Plotter.plot_gain()
+    #     Plotter.plot_final_phi_gens()
+    #     if args.NonUniform:
+    #         Plotter.plot_NUA_dists(args.Samples)
+    # else:
+    #     Plotter.plot_final_phi()
+    #     Plotter.plot_final_counts()
+    #     Plotter.animate_counts()
+    #     Plotter.animate_phi()
+    #     Plotter.plot_gain()
+    #     if args.NonUniform:
+    #         Plotter.plot_NUA_dists(args.Samples)
+
+    Plotter.generate_nx_plot()
