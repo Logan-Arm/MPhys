@@ -818,6 +818,7 @@ class SimulationGensConfig:
     import_data: bool
     read_dir: str
     gamma: float
+    focuses:int
     passed_focuses: list
     intergenA: float
     generation_overlap: bool = False
@@ -833,6 +834,548 @@ class SimulationNoiseConfig:
     stds: list = None
     weight: list = None
 
+class FileSaver:
+    """Class responsible for saving all the data from the ensemble dynamics"""
+    def __init__(self,base_config):
+        self.output_dir = base_config.output_dir
+        self.save_dir = self.output_dir / "raw"
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.num_measurements = int(
+            base_config.iterations // base_config.time_res
+        )
+        self.S = base_config.num_signals
+        self.M = base_config.num_meanings
+
+    def generate_h5_file(self,num_gens, export = False, num_agents = None):
+        """Generates the h5_file used to store data as the experiment runs, should only be
+        used after the initial ensemble arrays have been calculated"""
+        self.h5_dir = Path(self.save_dir)/"array_data.h5"
+        with h5py.File(name = self.h5_dir, mode="w") as f:
+            """Ensemble_Phi Data"""
+            phi = f.create_dataset(name = "Phi/phi_dataset",shape=(self.num_measurements, self.S, self.M),
+                            dtype=np.float64,
+                            chunks=True,)
+
+            phi.attrs["description"] = "Ensemble phi arrays over time"
+            phi.attrs["num_signals"] = self.S
+            phi.attrs["num_meanings"] = self.M
+
+            """Generation specific phi data"""
+            phi_gens = f.create_dataset(name = "Phi/phi_gens_dataset",shape=(self.num_measurements, num_gens + 1, self.S, self.M),
+                            maxshape=(self.num_measurements, None, self.S, self.M),
+                            dtype=np.float64,
+                            chunks=True,)
+
+            # Want it to be none in both the first and second generation to allow in simulation updates later on
+            phi_gens.attrs["description"] = (
+                "Generation specific average phi arrays over time"
+            )
+            phi_gens.attrs["num_signals"] = self.S
+            phi_gens.attrs["num_meanings"] = self.M
+            phi_gens.attrs["num_gens"] = num_gens
+
+
+            """Ensemble_n(S|M) Data"""
+            counts = f.create_dataset(name = "counts/counts_dataset",
+                                    shape=(self.num_measurements, self.S, self.M),
+                                                    dtype=np.float64,
+                                                    chunks=True,)
+            counts.attrs["description"] = (
+                "Ensemble signal meaning count array over time "
+            )
+            counts.attrs["num_signals"] = self.S
+            counts.attrs["num_meanings"] = self.M
+
+            """Generation specific counts data, copying same overall structure as the gens phi"""
+
+            counts_gens = f.create_dataset(name ="counts/counts_gens_dataset",
+                            shape=(self.num_measurements, num_gens + 1, self.S, self.M),
+                            maxshape=(self.num_measurements, None, self.S, self.M),
+                            dtype=np.float64,
+                            chunks=True,)
+            # Want it to be none in both the first and second generation to allow in simulation updates later on
+            counts_gens.attrs["description"] = (
+                "Generation specific average counts arrays over time"
+            )
+            counts_gens.attrs["num_signals"] = self.S
+            counts_gens.attrs["num_meanings"] = self.M
+            counts_gens.attrs["num_gens"] = num_gens
+
+            # print(f"Starting h5_counts_gens values")
+            # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
+            # print(f"Avg map is {self.avg_map}")
+
+            """If self.export_agents set to true, we need an array to save the final phi and count arrays from all agents """
+            if export:
+                agents_phi = f.create_dataset(
+                    name="agents_phi/agents_phi_data",
+                    shape=(num_agents, self.S, self.M),
+                    dtype=np.float64,
+                )
+                agents_phi.attrs["description"] = (
+                    "Each agent in the simulation's final phi array"
+                )
+                agents_phi.attrs["num_signals"] = self.S
+                agents_phi.attrs["num_meanings"] = self.M
+
+
+                agents_counts = f.create_dataset(name = "agents_counts/agents_counts_data",
+                    shape=(num_agents, self.S, self.M),
+                    dtype=np.float64,)
+                
+                agents_counts.attrs["description"] = (
+                    "Each agent in the simulation's final phi array"
+                )
+                agents_counts.attrs["num_signals"] = self.S
+                agents_counts.attrs["num_meanings"] = self.M
+            f.close()
+
+    def open_h5_file(self,mode  = 'r+'):
+        if not self.h5_dir.exists():
+            raise FileNotFoundError(f"{self.h5_dir} file does not exist, create_h5_file must be called before open_h5 file")
+        return h5py.File(self.h5_dir,mode)
+
+    def write_to_h5(self,idx_iter:int, phi:np.ndarray,counts:np.ndarray,num_gens:int,
+                    avg_map:np.ndarray = None,gain_values:list=None, gens_gain:dict=None, gain_epochs: list = None):
+        """Writes the ensemble data to the h5 file.  If have multiple gens and want data stored separately, the average map must be passed to the function.
+        If agent data is meant to be exported, such that the configuration can be continued at a later date, export must be set to true."""
+
+        if gain_values is not None:
+            """Only one set of gain values, corresponds to 1 gen case"""
+            pd.DataFrame({"epoch": gain_epochs, "gain": gain_values}).to_csv(
+                self.save_dir / "gain_values.csv", index=False
+            )
+        ###########################################################################################################################
+        """Number of gens is currently hardcoded into how the pandas file handles the data, in the future, it may be better
+        to shift this sort of thing into a numpy array, and use h5"""
+        if gens_gain is not None:
+            """Multiple generation gains, corresponds to system of multiple communicators"""
+            pd.DataFrame(
+                {
+                    "epoch": gain_epochs,
+                    "ensemble_gain": gens_gain[0],
+                    "gen_0_gain": gens_gain[1],
+                    "gen_1_gain": gens_gain[2],
+                }
+            ).to_csv(self.save_dir / "gen_gain_values.csv", index=False)
+        ###########################################################################################################################
+
+        if idx_iter is not None:
+            """If iteration is not none, we append the data we found to the h5py file we initialised earlier"""
+
+            with self.open_h5_file() as f:
+
+                f["Phi/phi_dataset"][idx_iter, :, :] = phi.mean(axis=0)
+                f["counts/counts_dataset"][idx_iter, :, :] = counts.mean(axis=0)
+
+                if avg_map is not None:
+                    """If an average map is passed then we save to gen specific h5 structures"""
+                    start_idx = 0
+                    for k in range(num_gens + 1):
+                        end_idx = avg_map[k] + start_idx
+                        ensemble_phi = phi[start_idx:end_idx, :, :]
+                        ensemble_counts = counts[start_idx:end_idx, :, :]
+                        f["Phi/phi_gens_dataset"][idx_iter, k, :, :] = ensemble_phi.mean(axis=0)
+                        f["counts/counts_gens_dataset"][idx_iter, k, :, :] = ensemble_counts.mean(
+                            axis=0
+                        )
+                        start_idx = end_idx
+                f.close()
+
+    def save_agents_data(self, num_agents:int, phi:np.ndarray, counts:np.ndarray):
+        """A function to be called if export agents is set to true, saves the individual agent's phi and count arrays to the h5 file"""
+        with h5py.File(self.h5_dir, "a") as f:
+            agents_phi_group = f["agents_phi"]
+            agents_phi_data = agents_phi_group["agents_phi_data"]
+            agents_counts_group = f["agents_counts"]
+            agents_counts_data = agents_counts_group["agents_counts_data"]
+            for i in range(num_agents):
+                agents_phi_data[i, :, :] = phi[i, :, :]
+                agents_counts_data[i, :, :] = counts[i, :, :]
+
+            f.close()
+        print("Agent data saved")
+
+    def save_params(self,params_df:pd.DataFrame):
+        """Saves a passed data frame to a csv file."""
+        params_file = self.output_dir / "simulation_parameters.csv"
+        params_df.to_csv(params_file, index=False)
+        print(f"Saved simulation parameters to {params_file}")
+
+
+class Constructor:
+    """A constructor helper class which is responsible for instantiating the phi and count arrays either from a fresh array, or from file imports.
+    The constructor takes the basic config values passed to it from the ensemble, from which point it instantiates a base state.  This base state is 
+    then further modified depending on the specific configuration we are wanting to create.  All these state values are then packed into a dict,
+    and then handed back to the ensemble class to unpack.  This is done intentionally, as I want all the tensors, and values to be ensemble specific items,
+    not ensemble.constructor___ items. 
+
+    Basic flow is this:
+    Ensemble_init ->
+    Constructor_init ->
+    Constructor_base_state ->
+    Constructor_specific_state -->
+    return specific_state-->
+    for key, value in state.items():
+        setattr(self, key, value)
+    
+    """
+
+    def __init__(self,base_config:SimulationBaseConfig,gens_config:SimulationGensConfig,noise_config:SimulationNoiseConfig):
+        """Instantiates all the major constructor variables from the given configs"""
+        
+        self.base_config = base_config
+        self.gens_config = gens_config
+        self.noise_config = noise_config
+
+        # Extract all the commonly used values for convenience
+        self.M = base_config.num_meanings
+        self.S = base_config.num_signals
+        self.num_agents = 0
+        self.alpha = base_config.alpha
+        self.beta = base_config.beta
+        self.lambda_val = base_config.lambda_val
+        self.A = base_config.alignment
+
+        # State parameters
+        self.avg_map = [] #Guide to which indices in the tensors belong to which generation
+        self.num_gens = 0
+        self.gen_focuses = []
+        self.possible_focuses = np.arange(self.M).tolist()
+        self.gen_speaker_gens = None
+        self.gen_speaker_lambda = None
+        self.gen_speaker_align = None
+        self.gen_agent_dict = None
+        self.gamma = gens_config.gamma
+
+
+        self.read_dir = Path(gens_config.read_dir)
+
+    def create_generation_focuses(
+        self, number_focuses:int=2, supplied_focuses:list=None, remove_focuses:bool=True, gamma:float=None
+    ):
+        """A function to return attentional counts, modified by a select number of attentional focuses, for a generation.
+        Focuses are either selected randomly from an inputted list of allowed focuses, or they are supplied directly.  The degree to which these counts are modifed
+        ('focused on') comes from the parameter gamma, which is a straighforward multiplier of the number of counts.  All meanings
+        not within the group of selected focuses have a count value corresponding to beta/M where M is total number of meanings.
+
+        If remove_focuses is set to true, the function removes the selected or inputted focuses from the possible focuses list
+        """
+        if gamma is None:
+            gamma = self.gamma
+
+        if supplied_focuses is None:
+            selected_focuses = np.random.choice(
+                self.possible_focuses, size=number_focuses, replace=False
+            )
+            self.gen_focuses.append(selected_focuses.tolist())
+        else:
+            selected_focuses = supplied_focuses
+            self.gen_focuses.append(selected_focuses)
+
+        gen_counts = np.full(self.M, (self.beta / self.M))
+        for focus in selected_focuses:
+            gen_counts[focus] *= gamma
+            if remove_focuses:
+                # print(f"Debug, inst_focus is {focus}")
+                self.possible_focuses.remove(focus)
+
+        return gen_counts, selected_focuses
+
+    def generate_non_uniform_A(self,N,means, stds, weight):
+            """
+            In a non-uniform alignment situation, alignment between each agent/communicator is selected via a bimodal distribution.
+            It is important to note that these alignments are not assigned to agents directly, but assigned however to the actual 
+            interactions between specific agents.   
+    
+            We accomplish this by leveraging the fact that N(mu,sigma) = sigma * Z + mu where Z selected from N(0,1)
+    
+            """
+    
+            rng = np.random.default_rng()
+            
+            z_vals = rng.standard_normal(size = (N,N))
+            weight_draws = rng.random(size = (N,N))
+            draw_map = weight_draws>=weight
+            draw_means = np.where(draw_map,means[0],means[1])
+            draw_std = np.where(draw_map,stds[0],stds[1])
+    
+            bimod_draw = draw_std*z_vals + draw_means
+            filtered_vals = np.where((bimod_draw>1.0),1.0,bimod_draw)
+            print(f"Debug: filtered_vals has shape {filtered_vals.shape}")
+            print(filtered_vals)
+            return filtered_vals
+    
+    def generate_non_uniform_A_symmetric(self,N,means,stds,weight):
+        """Similar procedure to the base version, except that this generates the alignment matrix symmetrically, such that interactions
+        between agents are symmetric pairwise (prevents possibility that for same 2 agents, one speaker is preferred)
+        
+        N = number of speakers
+        means = means of bimodal distribution
+        stds = sigma of bimodal distribution
+        weight = weight of first dist in bimodal distribution (1-weight is weight of other)
+        """
+
+        upper_triangle_indices = np.triu_indices(N,k=1) #start from k =1, self interactions are not possible -> main diagonal should be zero
+        num_pairs = len(upper_triangle_indices[0])
+
+        #Rest of procedure very similar
+        rng = np.random.default_rng()
+
+        z_vals = rng.standard_normal(num_pairs)
+        draw_map = rng.random(num_pairs)>=weight
+
+        drawed_means = np.where(draw_map,means[0],means[1])
+        drawed_stds =  np.where(draw_map,stds[0],stds[1])
+
+        draws = np.clip(drawed_means+(drawed_stds*z_vals),0.0,1.0)
+
+        A = np.zeros((N,N))
+        A[upper_triangle_indices] = draws
+        A = A + A.T
+        return A
+
+    def read_param_file(self, params_dir):
+        """
+        dir: params_directory
+
+        Reads the inputted parameter.csv file and updates/records the relevant ensemble parameter values accordingly"""
+        params_df = pd.read_csv(params_dir / "simulation_parameters.csv")
+        self.imported_meanings = params_df["num_meanings"][0]
+        # print(self.M)
+        self.imported_signals = params_df["num_signals"][0]
+        self.num_imported_agents = params_df["num_agents"][0]
+        self.imported_gens_lambda = params_df["lambda"][0]
+        self.imported_beta = params_df["beta"][0]
+
+        old_gamma = params_df["gamma"][0]
+        if self.gamma is None:
+            self.gamma = old_gamma
+        else:
+            self.imported_gamma = old_gamma
+
+        self.imported_gen_focuses = params_df["generation_focuses"].apply(
+            ast.literal_eval
+        )[0]
+        self.imported_A = params_df["alignment"][0]
+        # Need the extra handling to convert the csv's string back into an actual python list
+
+    def _construct_uniform_A(self,state):
+        """Helper function that takes a base state and returns a simulation state configured with uniform alignment for each agent.
+           """
+
+        print("Instantiating speakers with no focuses and uniform alignment")
+        num_added = baseconfig.num_agents
+        self.num_agents += num_added
+
+        self.alpha_tensor = np.full((self.M), fill_value=(self.beta / self.M))
+
+        self.population_phi = np.full(
+            (self.num_agents, self.S, self.M), fill_value=1 / self.S
+        )
+        self.population_counts = np.zeros((self.num_agents, self.S, self.M))
+        self.avg_map.append(self.num_agents)
+
+        self.speaker_gens = np.zeros(
+            self.num_agents, dtype=np.int16
+        )  # As of now, only really operating with gens listed from 0-1 (maybe 2)
+        # no need for high bit count
+        self.speaker_gens[:] = int(self.num_gens)
+        self.speaker_lambda = np.zeros(self.num_agents, dtype=np.float64)
+        self.speaker_lambda[:] = self.lambda_val
+
+        self.speaker_align = np.full((self.num_agents), fill_value=self.A)
+
+        state.update({
+            'num_agents': self.num_agents,
+            'population_phi': self.population_phi,
+            'population_counts': self.population_counts,
+            'alpha_tensor': self.alpha_tensor,
+            'speaker_gens': self.speaker_gens,
+            'speaker_lambda': self.speaker_lambda,
+            'speaker_align': self.speaker_align,
+            'avg_map': self.avg_map
+            })
+
+        return state
+
+    def _construct_NuA(self,state):
+        """Helper function that takes a base state and returns a simulation state configured for a non-uniform (typically bimodal) alignment
+        matrix for interactions"""
+        print("Instantiating speakers with no focuses and non uniform alignment")
+        num_added = baseconfig.num_agents
+        self.num_agents += num_added
+
+
+
+        self.speaker_align = self.generate_non_uniform_A_symmetric(self.num_agents,self.noise_config.means,self.noise_config.stds,self.noise_config.weight)
+        print(f"Debug, in _construct_NuA, self.speaker_align has shape {self.speaker_align.shape}")
+        
+        self.alpha_tensor = np.full((self.M), fill_value=(self.beta / self.M))
+
+        self.population_phi = np.full(
+            (self.num_agents, self.S, self.M), fill_value=1 / self.S
+        )
+        self.population_counts = np.zeros((self.num_agents, self.S, self.M))
+        self.avg_map.append(self.num_agents)
+        self.speaker_gens = np.zeros(
+            self.num_agents, dtype=np.int16
+        )  # As of now, only really operating with gens listed from 0-1 (maybe 2)
+        # no need for high bit count
+        self.speaker_gens[:] = int(self.num_gens)
+        self.speaker_lambda = np.zeros(self.num_agents, dtype=np.float64)
+        self.speaker_lambda[:] = self.lambda_val
+        state.update({
+            'num_agents': self.num_agents,
+            'population_phi': self.population_phi,
+            'population_counts': self.population_counts,
+            'alpha_tensor': self.alpha_tensor,
+            'speaker_gens': self.speaker_gens,
+            'speaker_lambda': self.speaker_lambda,
+            'speaker_align': self.speaker_align,
+            'means':self.noise_config.means,
+            'stds':self.noise_config.stds,
+            'weight':self.noise_config.weight,
+            'avg_map': self.avg_map
+            })
+        return state
+
+    def _construct_w_focuses(self,state):
+        """Helper function that takes a base state and returns a simulation state configured with focused alpha vectors (i.e., modified by gamma)"""
+
+        print("Instantiating speakers with focuses and uniform alignment")
+        num_added = baseconfig.num_agents
+        self.num_agents += num_added
+        gen_counts,_ =self.create_generation_focuses(self.gens_config.focuses,self.gens_config.passed_focuses,gamma=self.gens_config.gamma)
+        self.alpha_tensor = np.array(gen_counts)
+        
+        self.population_phi = np.full(
+            (self.num_agents, self.S, self.M), fill_value=1 / self.S
+        )
+        self.population_counts = np.zeros((self.num_agents, self.S, self.M))
+        self.avg_map.append(self.num_agents)
+        
+
+        self.speaker_gens = np.zeros(
+            self.num_agents, dtype=np.int16
+        )  # As of now, only really operating with gens listed from 0-1 (maybe 2)
+        # no need for high bit count
+        self.speaker_gens[:] = int(self.num_gens)
+        self.speaker_lambda = np.zeros(self.num_agents, dtype=np.float64)
+        self.speaker_lambda[:] = self.lambda_val
+
+        self.speaker_align = np.full((self.num_agents), fill_value=self.A)
+        # self.speaker_align = self.A
+        state.update({
+            'num_agents': self.num_agents,
+            'population_phi': self.population_phi,
+            'population_counts': self.population_counts,
+            'alpha_tensor': self.alpha_tensor,
+            'speaker_gens': self.speaker_gens,
+            'speaker_lambda': self.speaker_lambda,
+            'speaker_align': self.speaker_align,
+            'gen_focuses': self.gen_focuses,
+            'avg_map': self.avg_map, 
+            'possible_focuses':self.possible_focuses
+            })
+        return state
+
+    def _construct_from_imports(self,state):
+        """Helper function that takes a base state and returns a simulation state configured to the imported agents"""
+        print("Instantiating speakers from ImportFile")
+        
+        self.read_param_file(params_dir=self.read_dir)
+
+        with h5py.File(self.read_dir/"raw"/ "array_data.h5", "r") as f:
+            final_phis = f["agents_phi"]["agents_phi_data"]
+            final_counts = f["agents_counts"]["agents_counts_data"]
+
+            self.population_phi = final_phis[:]
+            self.population_counts = final_counts[:]
+            self.avg_map.append(self.num_imported_agents)
+
+            #############################################################################################################################################
+            if len(self.imported_gen_focuses) != 0:
+                gen_counts, _focuses = self.create_generation_focuses(
+                    len(self.imported_gen_focuses),
+                    supplied_focuses=self.imported_gen_focuses[0],
+                    gamma=self.imported_gamma,
+                )
+                self.alpha_tensor = np.array(gen_counts)
+            else:
+                self.alpha_tensor = np.full((self.M), fill_value=(self.beta / self.M))
+            """NOTE: Above line will absolutely break if importing more than one generation, special care will be needed when that is done"""
+            #############################################################################################################################################
+
+        f.close()
+
+        num_added = self.population_phi.shape[0]
+        print(f"Num added is {self.population_phi.shape[0]}")
+        self.num_agents += num_added
+
+        self.speaker_gens = np.zeros(
+            self.num_agents, dtype=np.int16
+        )  # As of now, only really operating with gens listed from 0-1 (maybe 2)
+        # no need for high bit count
+        self.speaker_gens[:] = int(self.num_gens)
+        self.speaker_lambda = np.zeros(self.num_agents, dtype=np.float64)
+        self.speaker_lambda[:] = self.imported_gens_lambda
+
+        self.speaker_align = np.full(num_added,self.imported_A, dtype=np.float64)
+        """As of now no imported speakers are being passed the alignment"""
+        # self.speaker_align = self.A
+        
+        state.update({
+            'num_agents': self.num_agents,
+            'population_phi': self.population_phi,
+            'population_counts': self.population_counts,
+            'alpha_tensor': self.alpha_tensor,
+            'speaker_gens': self.speaker_gens,
+            'speaker_lambda': self.speaker_lambda,
+            'speaker_align': self.speaker_align,
+            'gen_focuses': self.gen_focuses,
+            'avg_map': self.avg_map,
+            'possible_focuses':self.possible_focuses
+            })
+        return state
+
+    def construct_simulation_state(self):
+        """Generates the simulation specific state.  Does this first via generating a base state dict, which is then passed
+        to a more specific helper function for the specific configuration desired (i.e., non-uniform alignment, multi-gen, single-pop, etc)"""
+
+        state = {
+        'M': self.M,
+        'S': self.S,
+        'num_agents': 0,
+        'alpha': self.alpha,
+        'beta':self.beta,
+        'gamma':self.gamma,
+        'alpha_on_s': self.alpha / self.S,
+        'lambda_val': self.lambda_val,
+        'A': self.A,
+        'time_res': self.base_config.time_res,
+        'tot_iterations': self.base_config.iterations,
+        'export_agents': self.base_config.export,
+        'num_gens': 0,
+        'avg_map': [],
+        'gen_focuses': [],
+        'intergen_A': self.gens_config.intergenA,
+        'param_dir':self.read_dir,
+        }
+        if self.gens_config.havefocuses:
+            if self.gens_config.import_data:
+                return self._construct_from_imports(state)
+            else:
+                return self._construct_w_focuses(state)
+        else:
+            if self.noise_config.uniformA:
+                return self._construct_uniform_A(state)
+            else:
+                return self._construct_NuA(state)
+
+
+
 
 class Ensemble:
     def __init__(
@@ -843,121 +1386,27 @@ class Ensemble:
     ):
         print("Initializing")
 
-        """Unpacking all necessary elements from the simulation base config"""
+        """Unpacking all elements from the base config NOT unpacked by the constructor"""
+
         print("Unpacking Base Config")
-        self.M = basic_config.num_meanings
+    
         self.meanings_integers = np.arange(basic_config.num_meanings, dtype=int)
-
-        self.S = basic_config.num_signals
         self.signals_integers = np.arange(basic_config.num_signals, dtype=int)
-
-        self.num_agents = 0  # Incremented via addition of agents, not always same procedure so initiated from 0
-        self.beta = basic_config.beta
-        self.alpha = basic_config.alpha
-        self.alpha_on_s = self.alpha / self.S
-        self.C = 1 / (1 + self.beta)
-        self.lambda_val = basic_config.lambda_val
+        self.C = 1 / (1 + basic_config.beta)
         self.time_res = basic_config.time_res
         self.tot_iterations = basic_config.iterations
         self.num_measurements = int(
             self.tot_iterations // self.time_res
         )  # This was being read as a float despite the integer division, not sure why
-        self.output_dir = Path(basic_config.output_dir)
-        self.A = basic_config.alignment
-
-        self.export_agents = basic_config.export
 
         self.gain_epochs = []
-
         # List to store the alpha arrays of each generation
-        self.avg_map = []
-        # Guide to which indices of the tensors correspond to each generation
 
-        self.num_gens = 0
-
-        """Unpacking all the noise/alignment information from simulation noise config.  We must know the status of the alignment
-        before we instantiate our agents"""
-        print("Unpacking Noise Config")
-        if noise_config.uniformA is not True:
-            self.means = noise_config.means
-            self.stds = noise_config.stds
-            self.weight = noise_config.weight
-
-        """Unpacking all necessary information from simulation gens config"""
-        """Currently this works under the assumption that we are only ever importing data with focuses, this tends to be the case in the studies 
-        that I am doing, but it is not a rule per se."""
-        print("Unpacking Gens Config")
-        self.gamma = gens_config.gamma
-        self.gen_focuses = []
-        self.gen_alpha_dists = []
-        self.intergen_A = gens_config.intergenA
-
-        
-        param_dir = Path(gens_config.read_dir)
-        self.param_dir = param_dir  # needed for the save params func, modify later
-        
-
-        if gens_config.havefocuses:
-            self.possible_focuses = np.arange(
-                self.M
-            ).tolist()  # Create a list to store all possible focuses, and then remove as necessary
-            import_data = gens_config.import_data
-            if import_data:
-                print("Importing data")
-                param_dir = Path(gens_config.read_dir)
-                self.param_dir = (
-                    param_dir  # needed for the save params func, modify later
-                )
-                raw_dir = param_dir / "raw"
-                self.read_param_file(param_dir)
-                print("Param File Read")
-                num_imported_focuses = len(self.imported_gen_focuses)
-                self.create_initial_tensors_from_inputs(num_imported_focuses, raw_dir)
-                print("Imported agents with focuses")
-            else:
-                """If have focuses but no import, we instantiate our agents using the passed focuses in the config"""
-                assert gens_config.passed_focuses is not None, (
-                    "Cannot instantiate focused generation without passed focuses"
-                )
-                if noise_config.uniformA:
-                    """Uniform alignment, no need to pass an alignment vector"""
-                    self.create_initial_tensors(
-                        num_agents=basic_config.num_agents,
-                        passed_focuses=gens_config.passed_focuses,
-                    )
-                    print("Agents with focuses and uniform alignment created")
-                else:
-                    alignvec = self.generate_non_uniform_A_symmetric(
-                        basic_config.num_agents, self.means, self.stds, self.weight
-                    )
-                    print(
-                        f"Debug: means, stds, weight {self.means},{self.stds},{self.weight}"
-                    )
-
-                    print(f"Debug: NuA has shape {alignvec.shape}")
-
-                    self.create_initial_tensors(
-                        num_agents=basic_config.num_agents,
-                        passed_focuses=gens_config.passed_focuses,
-                        align_vec=alignvec,
-                    )
-                    print("Agents with focuses and non-uniform alignment created ")
-        else:
-            """No focuses just check if we have uniform alignment or not"""
-            if noise_config.uniformA:
-                self.create_initial_tensors(num_agents=basic_config.num_agents)
-                print("Agents with uniform alignment created")
-            else:
-                alignvec = self.generate_non_uniform_A_symmetric(
-                    basic_config.num_agents, self.means, self.stds, self.weight
-                )
-                print(
-                    f"Debug: means, stds, weight {self.means},{self.stds},{self.weight}"
-                )
-                self.create_initial_tensors(
-                    num_agents=basic_config.num_agents, align_vec=alignvec
-                )
-                print("Agents with non-uniform alignment created")
+        print("Initialising Constructor")
+        self.constructor = Constructor(basic_config,gens_config,noise_config)
+        self.constructed_state = self.constructor.construct_simulation_state() #Keep the state such that we can pass it back into the constructor later to change state
+        for key, value in self.constructed_state.items():
+            setattr(self,key,value) #writing the constructor state variables to ensemble variables
 
         """Debugging sections below while the code is still being made"""
         # print(f"Number of imported agents is {self.num_imported_agents}")
@@ -968,6 +1417,8 @@ class Ensemble:
         )
         print(f"Number of agents is {self.num_agents}")
         # self.numba_warmup()
+
+        self.file_saver = FileSaver(basic_config)
 
     def read_param_file(self, params_dir):
         """
@@ -1029,83 +1480,6 @@ class Ensemble:
 
         return gen_counts, selected_focuses
 
-    #############################################################################################################################################
-    def create_initial_tensors_from_inputs(self, num_import_focuses: int, raw_dir: str):
-        """
-        num_import_focuses is the number of focuses the imported generation has
-        raw_dir is the directory reading to the h5 file containing the information of this generation
-
-        Function to create the initial ensemble tensors from imported data"""
-        with h5py.File(raw_dir / "array_data.h5", "r") as f:
-            final_phis = f["agents_phi"]["agents_phi_data"]
-            final_counts = f["agents_counts"]["agents_counts_data"]
-
-            self.population_phi = final_phis[:]
-            self.population_counts = final_counts[:]
-            self.avg_map.append(self.num_imported_agents)
-
-            #############################################################################################################################################
-            if num_import_focuses != 0:
-                gen_counts, _focuses = self.create_generation_focuses(
-                    num_import_focuses,
-                    supplied_focuses=self.imported_gen_focuses[0],
-                    gamma=self.imported_gamma,
-                )
-                self.alpha_tensor = np.array(gen_counts)
-            else:
-                self.alpha_tensor = np.full((self.M), fill_value=(self.beta / self.M))
-            """NOTE: Above line will absolutely break if importing more than one generation, special care will be needed when that is done"""
-            #############################################################################################################################################
-
-        f.close()
-
-        num_added = self.population_phi.shape[0]
-        print(f"Num added is {self.population_phi.shape[0]}")
-        self.num_agents += num_added
-
-        self.speaker_gens = np.zeros(
-            self.num_agents, dtype=np.int16
-        )  # As of now, only really operating with gens listed from 0-1 (maybe 2)
-        # no need for high bit count
-        self.speaker_gens[:] = int(self.num_gens)
-        self.speaker_lambda = np.zeros(self.num_agents, dtype=np.float64)
-        self.speaker_lambda[:] = self.imported_gens_lambda
-
-        self.speaker_align = np.zeros(self.num_agents, dtype=np.float64)
-        """As of now no imported speakers are being passed the alignment"""
-        self.speaker_align = self.A
-
-    def create_initial_tensors(self, num_agents, passed_focuses=None, align_vec=None):
-        """Function to create the initial ensemble tensors at their base values, i.e., in the case of no imported agents"""
-        if passed_focuses is not None:
-            gen_counts, _selected_focuses = self.create_generation_focuses(
-                number_focuses=2, supplied_focuses=passed_focuses
-            )
-            self.alpha_tensor = np.array(gen_counts)
-        else:
-            self.alpha_tensor = np.full((self.M), fill_value=(self.beta / self.M))
-
-        self.population_phi = np.full(
-            (num_agents, self.S, self.M), fill_value=1 / self.S
-        )
-        self.population_counts = np.zeros((num_agents, self.S, self.M))
-        self.avg_map.append(num_agents)
-        self.num_agents += num_agents
-
-        self.speaker_gens = np.zeros(
-            self.num_agents, dtype=np.int16
-        )  # As of now, only really operating with gens listed from 0-1 (maybe 2)
-        # no need for high bit count
-        self.speaker_gens[:] = int(self.num_gens)
-        self.speaker_lambda = np.zeros(self.num_agents, dtype=np.float64)
-        self.speaker_lambda[:] = self.lambda_val
-
-        self.speaker_align = np.zeros((self.num_agents,self.num_agents), dtype=np.float64)
-        if align_vec is not None:
-            self.speaker_align = align_vec
-        else:
-            self.speaker_align = self.A
-
     def compile_speaker_info(self):
         """Compiles all the separate 1d speaker arrays into one speaker_info namedtuple, to make passing information to the jitted
         numba functions far easier to read.  Should be called before any numba functions (including the warmups!)"""
@@ -1143,184 +1517,8 @@ class Ensemble:
         print("Test blind success outer loop")
         blind_success_outer_loop(self.num_agents, self.population_phi, self.S, self.M)
 
-    def generate_initial_h5_file(self):
-        """Generates the h5_file used to store data as the experiment runs, should only be
-        used after the initial ensemble arrays have been calculated"""
-        save_dir = self.output_dir / "raw"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        self.h5_dir = Path(save_dir)/"array_data.h5"
-        with h5py.File(name = self.h5_dir, mode="w") as f:
-
-            """Ensemble_Phi Data"""
-            phi = f.create_dataset(name = "Phi/phi_dataset",shape=(self.num_measurements, self.S, self.M),
-                            dtype=np.float64,
-                            chunks=True,)
-
-            phi.attrs["description"] = "Ensemble phi arrays over time"
-            phi.attrs["num_signals"] = self.S
-            phi.attrs["num_meanings"] = self.M
-
-            phi[0, :, :] = self.population_phi.mean(axis=0)
-
-            """Generation specific phi data"""
-            phi_gens = f.create_dataset(name = "Phi/phi_gens_dataset",shape=(self.num_measurements, self.num_gens + 1, self.S, self.M),
-                            maxshape=(self.num_measurements, None, self.S, self.M),
-                            dtype=np.float64,
-                            chunks=True,)
-
-            # Want it to be none in both the first and second generation to allow in simulation updates later on
-            phi_gens.attrs["description"] = (
-                "Generation specific average phi arrays over time"
-            )
-            phi_gens.attrs["num_signals"] = self.S
-            phi_gens.attrs["num_meanings"] = self.M
-            phi_gens.attrs["num_gens"] = self.num_gens
-
-            # print(f"Starting h5_phi_gens values")
-            # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
-            # print(f"Avg map is {self.avg_map}")
-            start_idx = 0
-            for i in range(self.num_gens + 1):
-                # print(i)
-                end_idx = start_idx + self.avg_map[i]
-                gens_phi = self.population_phi[start_idx:end_idx, :, :]
-                # print(f"Shape of gens_phi is {gens_phi.shape}")
-
-                phi_gens[0, i, :, :] = gens_phi.mean(axis=0)
-                start_idx = end_idx
-
-            """Ensemble_n(S|M) Data"""
-            counts = f.create_dataset(name = "counts/counts_dataset",
-                                    shape=(self.num_measurements, self.S, self.M),
-                                                    dtype=np.float64,
-                                                    chunks=True,)
-            counts.attrs["description"] = (
-                "Ensemble signal meaning count array over time "
-            )
-            counts.attrs["num_signals"] = self.S
-            counts.attrs["num_meanings"] = self.M
-
-            counts[0, :, :] = self.population_counts.mean(axis=0)
-
-            """Generation specific counts data, copying same overall structure as the gens phi"""
-
-            counts_gens = f.create_dataset(name ="counts/counts_gens_dataset",
-                            shape=(self.num_measurements, self.num_gens + 1, self.S, self.M),
-                            maxshape=(self.num_measurements, None, self.S, self.M),
-                            dtype=np.float64,
-                            chunks=True,)
-            # Want it to be none in both the first and second generation to allow in simulation updates later on
-            counts_gens.attrs["description"] = (
-                "Generation specific average counts arrays over time"
-            )
-            counts_gens.attrs["num_signals"] = self.S
-            counts_gens.attrs["num_meanings"] = self.M
-            counts_gens.attrs["num_gens"] = self.num_gens
-
-            # print(f"Starting h5_counts_gens values")
-            # print(f"Keys of gens dict is {self.gen_agent_dict.keys()}")
-            # print(f"Avg map is {self.avg_map}")
-            start_idx = 0
-            for i in range(self.num_gens + 1):
-                print(i)
-                end_idx = start_idx + self.avg_map[i]
-                gens_counts = self.population_counts[start_idx:end_idx, :, :]
-                print(f"Shape of gens_counts is {gens_counts.shape}")
-
-                counts_gens[0, i, :, :] = gens_counts.mean(axis=0)
-                start_idx = end_idx
-
-            """If self.export_agents set to true, we need an array to save the final phi and count arrays from all agents """
-            if self.export_agents:
-                agents_phi = f.create_dataset(
-                    name="agents_phi/agents_phi_data",
-                    shape=(self.num_agents, self.S, self.M),
-                    dtype=np.float64,
-                )
-                agents_phi.attrs["description"] = (
-                    "Each agent in the simulation's final phi array"
-                )
-                agents_phi.attrs["num_signals"] = self.S
-                agents_phi.attrs["num_meanings"] = self.M
-
-
-                agents_counts = f.create_dataset(name = "agents_counts/agents_counts_data",
-                    shape=(self.num_agents, self.S, self.M),
-                    dtype=np.float64,)
-                
-                agents_counts.attrs["description"] = (
-                    "Each agent in the simulation's final phi array"
-                )
-                agents_counts.attrs["num_signals"] = self.S
-                agents_counts.attrs["num_meanings"] = self.M
-            f.close()
-
-
-    def open_h5_file(self,mode  = 'r+'):
-        if not self.h5_dir.exists():
-            raise FileNotFoundError(f"{self.h5_dir} file does not exist, create_h5_file must be called before open_h5 file")
-        return h5py.File(self.h5_dir,mode)
-
-    def save_to_file(self, idx_iter):
-        """Save the experimental data to a file as it is calculated/experiment is performed"""
-        save_dir = self.output_dir / "raw"
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        if hasattr(self, "gain_values"):
-            """Only one set of gain values, corresponds to 1 gen case"""
-            pd.DataFrame({"epoch": self.gain_epochs, "gain": self.gain_values}).to_csv(
-                save_dir / "gain_values.csv", index=False
-            )
-
-        ###########################################################################################################################
-        """Number of gens is currently hardcoded into how the pandas file handles the data, in the future, it may be better
-        to shift this sort of thing into a numpy array, and use h5"""
-        if hasattr(self, "gens_gain"):
-            """Multiple generation gains, corresponds to system of multiple communicators"""
-            pd.DataFrame(
-                {
-                    "epoch": self.gain_epochs,
-                    "ensemble_gain": self.gens_gain[0],
-                    "gen_0_gain": self.gens_gain[1],
-                    "gen_1_gain": self.gens_gain[2],
-                }
-            ).to_csv(save_dir / "gen_gain_values.csv", index=False)
-        ###########################################################################################################################
-
-        if idx_iter is not None:
-            """If iteration is not none, we append the data we found to the h5py file we initialised earlier"""
-
-            with self.open_h5_file() as f:
-
-                f["Phi/phi_dataset"][idx_iter, :, :] = self.population_phi.mean(axis=0)
-                f["counts/counts_dataset"][idx_iter, :, :] = self.population_counts.mean(axis=0)
-
-                start_idx = 0
-                for k in range(self.num_gens + 1):
-                    end_idx = self.avg_map[k] + start_idx
-                    ensemble_phi = self.population_phi[start_idx:end_idx, :, :]
-                    ensemble_counts = self.population_counts[start_idx:end_idx, :, :]
-                    f["Phi/phi_gens_dataset"][idx_iter, k, :, :] = ensemble_phi.mean(axis=0)
-                    f["counts/counts_gens_dataset"][idx_iter, k, :, :] = ensemble_counts.mean(
-                        axis=0
-                    )
-                    start_idx = end_idx
-
-    def save_agents_data(self):
-        """A function to be called if export agents is set to true, saves the individual agent's phi and count arrays to the h5 file"""
-        with h5py.File(self.h5_dir, "a") as f:
-            agents_phi_group = f["agents_phi"]
-            agents_phi_data = agents_phi_group["agents_phi_data"]
-            agents_counts_group = f["agents_counts"]
-            agents_counts_data = agents_counts_group["agents_counts_data"]
-            for i in range(self.num_agents):
-                agents_phi_data[i, :, :] = self.population_phi[i, :, :]
-                agents_counts_data[i, :, :] = self.population_counts[i, :, :]
-
-            f.close()
-        print("Agent data saved")
-
-    def save_params(self, iterations):
+    def generate_DF(self,iterations):
+        """Creates a pandas data frame to then be passed to the file saver parameter saving function """
         if hasattr(self, "means"):
             params_dict = {
                 "num_meanings": self.M,
@@ -1342,6 +1540,7 @@ class Ensemble:
                 "NUA_stds": self.stds,
                 "NUA_weight": self.weight,
             }
+            print("NuA param df made")
         else:
             params_dict = {
                 "num_meanings": self.M,
@@ -1361,9 +1560,7 @@ class Ensemble:
                 "gen_alphas": np.asarray(self.alpha_tensor).tolist(),
             }
         params_df = pd.DataFrame([params_dict])
-        params_file = self.output_dir / "simulation_parameters.csv"
-        params_df.to_csv(params_file, index=False)
-        print(f"Saved simulation parameters to {params_file}")
+        return params_df
 
     def add_speakers(self, speakers_added, speakers_focuses=None, align_vec=None):
         """A function to add speakers into the system.  Extends the ensemble tensors by the appropriate amount, and then
@@ -1399,66 +1596,14 @@ class Ensemble:
         new_speaker_lambda = np.full(speakers_added, self.lambda_val, dtype=np.float64)
 
         if align_vec is not None:
-            new_speaker_align = np.zeros((speakers_added,speakers_added), dtype=np.float64)
+            # new_speaker_align = np.zeros((speakers_added,speakers_added), dtype=np.float64)
             new_speaker_align = align_vec
         else:
             new_speaker_align = np.full(speakers_added, self.A, dtype=np.float64)
 
-        self.speaker_align = np.concat((self.speaker_align, new_speaker_align))
+        self.speaker_align = np.concat((self.speaker_align, new_speaker_align),axis = 0)
         self.speaker_lambda = np.concat((self.speaker_lambda, new_speaker_lambda))
         self.speaker_gens = np.concat((self.speaker_gens, new_speaker_gens))
-
-
-    def generate_non_uniform_A(self,N,means, stds, weight):
-            """
-            In a non-uniform alignment situation, alignment between each agent/communicator is selected via a bimodal distribution.
-            It is important to note that these alignments are not assigned to agents directly, but assigned however to the actual 
-            interactions between specific agents.   
-    
-            We accomplish this by leveraging the fact that N(mu,sigma) = sigma * Z + mu where Z selected from N(0,1)
-    
-            """
-    
-            rng = np.random.default_rng()
-            
-            z_vals = rng.standard_normal(size = (N,N))
-    
-            weight_draws = rng.random(size = (N,N))
-    
-            draw_map = weight_draws>=weight
-    
-            draw_means = np.where(draw_map,means[0],means[1])
-            draw_std = np.where(draw_map,stds[0],stds[1])
-    
-            bimod_draw = draw_std*z_vals + draw_means
-            filtered_vals = np.where((bimod_draw>1.0),1.0,bimod_draw)
-            print(f"Debug: filtered_vals has shape {filtered_vals.shape}")
-            print(filtered_vals)
-            return filtered_vals
-    
-    
-    def generate_non_uniform_A_symmetric(self,N,means,stds,weight):
-        """Similar procedure to the base version, except that this generates the alignment matrix symmetrically, such that interactions
-        between agents are symmetric pairwise (prevents possibility that for same 2 agents, one speaker is preferred)"""
-
-        upper_triangle_indices = np.triu_indices(N,k=1) #start from k =1, self interactions are not possible -> main diagonal should be zero
-        num_pairs = len(upper_triangle_indices[0])
-
-        #Rest of procedure very similar
-        rng = np.random.default_rng()
-
-        z_vals = rng.standard_normal(num_pairs)
-        draw_map = rng.random(num_pairs)>=weight
-
-        drawed_means = np.where(draw_map,means[0],means[1])
-        drawed_stds =  np.where(draw_map,stds[0],stds[1])
-
-        draws = np.clip(drawed_means+(drawed_stds*z_vals),0.0,1.0)
-
-        A = np.zeros((N,N))
-        A[upper_triangle_indices] = draws
-        A = A + A.T
-        return A
 
     def measure_gen_gain(self, gen_gain_dict):
         """Function to measure the gain for systems with more than one generation.  It is valueable to
@@ -1488,6 +1633,37 @@ class Ensemble:
             gain = ((self.M * p_s) - 1) / (self.S - 1)
             gen_gain_dict[i + 1].append(gain)
             start_iter = end_iter
+
+    def measure_froben_norm(self):
+        """
+        Takes frobenius norm of the matrix product between the generation speaker average phi 
+        of two gens
+        
+        Measures the frobenius norm of the product of ensemble matrices.  Meant to provide another 
+        way to evaluate the homogeneity of the generations' communication.
+
+        """
+        save_indices = False
+        #Most of the values in this tensor will stay empty, this will not cost any memory however so not worried about overhead
+        frob_norm_tens= np.empty((self.num_gens+1,self.num_gens+1))
+        if not hasattr(self,"indices"):
+            self.indices = []
+            save_indices = True
+        buffer = np.empty((len(self.avg_map),self.S,self.M))
+
+
+        start_idx = 0
+        for z in range(len(self.avg_map)):
+            end_idx = self.avg_map[z] + start_idx
+            buffer[z,:,:] = self.population_phi[start_idx:end_idx, :, :].mean(axis =0)
+
+        rows,cols = np.triu_indices(self.num_gens+1,k=1) #K=1 to avoid self interactions
+        for j in range(len(cols)):
+            inst_product = buffer[rows[j],:,:] @ buffer[cols[j],:,:]
+            frob_norm_tens[rows[j],cols[j]] =  np.linalg.norm(inst_product,ord='fro')
+            if save_indices:
+                self.indices.append([rows[j],cols[j]])
+        return frob_norm_tens
 
     #############################################################################################################################################
     def add_intergen_alpha(self, gen_0_weight: float = 0.5, gen_1_weight: float = 0.5):
@@ -1551,7 +1727,11 @@ class Ensemble:
             """If the alpha tensor is greater than 1, we have more than one alpha tensor, and thus it needs to be reduced to a single vector"""
             self.alpha_tensor = self.alpha_tensor.mean(axis=0)
 
-        self.generate_initial_h5_file()
+        self.file_saver.generate_h5_file(self.num_gens,self.export_agents,self.num_agents) #trying the new file saving regime
+
+        #Save initial data
+        self.file_saver.write_to_h5(0,self.population_phi,self.population_counts,self.num_gens)
+
         for i in range(self.num_measurements):
             new_population_phi, new_population_counts = one_collection_loop_one_pop(
                 self.population_counts,
@@ -1563,7 +1743,6 @@ class Ensemble:
                 speaker_info=self.speaker_info,
                 iterations=self.time_res,
             )
-            self.save_to_file(idx_iter=i)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
             p_s = blind_success_outer_loop(
@@ -1578,10 +1757,14 @@ class Ensemble:
                 self.population_phi.sum(axis=1), 1.0
             )  # Check to make sure all the phi columns sum to 1
 
-        if self.export_agents:
-            self.save_agents_data()
+            #Write to file
+            self.file_saver.write_to_h5(i,self.population_phi,self.population_counts,self.num_gens,gain_values=self.gain_values, gain_epochs=self.gain_epochs)
 
-        self.save_params(iterations=self.tot_iterations)
+        if self.export_agents:
+            self.file_saver.save_agents_data(self.num_agents,self.population_phi,self.population_counts)
+
+        params_dataframe = self.generate_DF(iterations=self.tot_iterations)
+        self.file_saver.save_params(params_dataframe)
 
     def numba_warmup_intergen(self, gen_dict, gen_choice):
         print("Performing numba warmups for intergen")
@@ -1667,14 +1850,14 @@ class Ensemble:
         print("Caching required numba functions")
         inst_gen_choice = np.arange(len(self.avg_map))
 
-        for k in range(10):
-            print("Debug: Checking np.choice(inst_gen_choice)")
-            print(np.random.choice(inst_gen_choice,size = 2, replace = False))
-
         print(f"Debug inst_gen_choice is {inst_gen_choice}")
         # self.numba_warmup_intergen(gen_dict=gen_dict, gen_choice=inst_gen_choice)
 
-        self.generate_initial_h5_file()
+        self.file_saver.generate_h5_file(self.num_gens,self.export_agents,self.num_agents) #trying the new file saving regime
+        
+        #Save initial data
+        self.file_saver.write_to_h5(0,self.population_phi,self.population_counts,self.num_gens)
+
         for i in range(self.num_measurements):
             new_population_phi, new_population_counts = one_collection_loop_intergens(
                 self.population_counts,
@@ -1695,23 +1878,28 @@ class Ensemble:
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
 
-            # p_s = blind_success_outer_loop(self.num_agents,self.population_phi,self.S,self.M)
-            # gain = ((self.M*p_s) -1)/(self.S-1)
-            # self.gain_values.append(gain)
 
             self.measure_gen_gain(self.gens_gain)
             # print(f"Debug:Self.gens_gain[0] looks like {self.gens_gain[0]}")
 
+            # frob_test = self.measure_froben_norm()
+            # print(f"Debug: frob test is {frob_test}")
+
             self.gain_epochs.append((i + 1) * self.time_res)
             print(f"Completed iteration {(i + 1) * self.time_res}")
-            self.save_to_file(idx_iter=i)
+            self.file_saver.write_to_h5(i,self.population_phi,self.population_counts,self.num_gens,self.avg_map,
+                                        gens_gain=self.gens_gain,
+                                        gain_epochs=self.gain_epochs)
             assert np.allclose(
                 self.population_phi.sum(axis=1), 1.0
             )  # Check to make sure all the phi columns sum to 1
         if self.export_agents:
-            self.save_agents_data()
+            self.file_saver.save_agents_data(self.num_agents,self.population_phi,self.population_counts)
 
-        self.save_params(iterations=self.tot_iterations)
+
+        params_df = self.generate_DF(self.tot_iterations)
+        # self.save_params(iterations=self.tot_iterations)
+        self.file_saver.save_params(params_df)
 
     def training_loop_NuA(self):
         self.speaker_info = SpeakerInfo(
@@ -1723,15 +1911,11 @@ class Ensemble:
         
         self.gain_values = []
 
-        """Need a check to collapse the alpha tensor into one vector if there are more than one alphas.  Logic for doing so is it 
-        is easier to implement a check here, than to implement checks at every single instantiation of an agent/speaker group"""
+        self.file_saver.generate_h5_file(self.num_gens,self.export_agents,self.num_agents) #trying the new file saving regime
+        
+        #Save initial data
+        self.file_saver.write_to_h5(0,self.population_phi,self.population_counts,self.num_gens)
 
-        print(f"Debug: self.alpha_tensor.ndim is {self.alpha_tensor.ndim}")
-        if self.alpha_tensor.ndim > 1:
-            """If the alpha tensor is greater than 1, we have more than one alpha tensor, and thus it needs to be reduced to a single vector"""
-            self.alpha_tensor = self.alpha_tensor.mean(axis=0)
-
-        self.generate_initial_h5_file()
         for i in range(self.num_measurements):
             new_population_phi, new_population_counts = one_collection_loop_one_pop_NuA(
                 self.population_counts,
@@ -1743,7 +1927,6 @@ class Ensemble:
                 speaker_info=self.speaker_info,
                 iterations=self.time_res,
             )
-            self.save_to_file(idx_iter=i)
             self.population_phi = new_population_phi
             self.population_counts = new_population_counts
             p_s = blind_success_outer_loop(
@@ -1758,14 +1941,20 @@ class Ensemble:
                 self.population_phi.sum(axis=1), 1.0
             )  # Check to make sure all the phi columns sum to 1
 
+            self.file_saver.write_to_h5(i,self.population_phi,self.population_counts,self.num_gens,self.avg_map,
+                                        gain_values=self.gain_values,
+                                        gain_epochs=self.gain_epochs)
+
         if self.export_agents:
-            self.save_agents_data()
+            self.file_saver.save_agents_data(self.num_agents,self.population_phi,self.population_counts)
+        
+        
+        params_df = self.generate_DF(self.tot_iterations)
+        # self.save_params(iterations=self.tot_iterations)
+        self.file_saver.save_params(params_df)
 
-        self.save_params(iterations=self.tot_iterations)
-
-        np.save(self.output_dir/"align_matrix.npy",self.speaker_align)
+        np.save(self.file_saver.output_dir/"align_matrix.npy",self.speaker_align) #since this is temporary just hardcode it
         print("Debug:Speaker align saved")
-
 
     """
     Now outdated, unlikely to be utilized, helpful to keep around in case they are of interest again
@@ -1996,6 +2185,7 @@ if __name__ == "__main__":
         args.Import,
         input_dir,
         args.gamma,
+        args.Focuses,
         generation_overlap=False,
         passed_focuses=args.PassedFocuses,
         intergenA=args.GenAlign,
