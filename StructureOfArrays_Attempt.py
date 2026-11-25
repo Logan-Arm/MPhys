@@ -790,7 +790,7 @@ def one_collection_loop_one_pop_NuA(
 
 """End of interaction dynamics section"""
 ###############################################################
-
+"""Beginning of the relevent data classes to the simulation"""
 
 @dataclass(slots=True)
 class SimulationBaseConfig:
@@ -832,7 +832,11 @@ class SimulationNoiseConfig:
     uniformA: bool = True
     means: list = None
     stds: list = None
-    weight: list = None
+    weight: float = None
+"""End of data classes"""
+###############################################################
+"""Beginning of core classes for simulation"""
+
 
 class FileSaver:
     """Class responsible for saving all the data from the ensemble dynamics"""
@@ -1166,7 +1170,7 @@ class Constructor:
            """
 
         print("Instantiating speakers with no focuses and uniform alignment")
-        num_added = baseconfig.num_agents
+        num_added = self.base_config.num_agents
         self.num_agents += num_added
 
         self.alpha_tensor = np.full((self.M), fill_value=(self.beta / self.M))
@@ -1204,7 +1208,7 @@ class Constructor:
         """Helper function that takes a base state and returns a simulation state configured for a non-uniform (typically bimodal) alignment
         matrix for interactions"""
         print("Instantiating speakers with no focuses and non uniform alignment")
-        num_added = baseconfig.num_agents
+        num_added = self.base_config.num_agents
         self.num_agents += num_added
 
 
@@ -1241,6 +1245,46 @@ class Constructor:
             })
         return state
 
+    def _construc_NuA_w_focuses(self,state):
+        """Constructs a non-uniform alignment system similar to previous configurations, but with the inclusion of focuses """
+        
+        print("Instantiating speakers With focuses and Non-uniform alignment")
+        num_added = self.base_config.num_agents
+        self.num_agents += num_added
+        gen_counts,_ =self.create_generation_focuses(self.gens_config.focuses,self.gens_config.passed_focuses,gamma=self.gens_config.gamma)
+        self.alpha_tensor = np.array(gen_counts)
+
+        self.speaker_align = self.generate_non_uniform_A_symmetric(self.num_agents,self.noise_config.means,self.noise_config.stds,self.noise_config.weight)
+        print(f"Debug, in _construct_NuA, self.speaker_align has shape {self.speaker_align.shape}")
+        self.population_phi = np.full(
+            (self.num_agents, self.S, self.M), fill_value=1 / self.S
+        )
+        self.population_counts = np.zeros((self.num_agents, self.S, self.M))
+        self.avg_map.append(self.num_agents)
+        self.speaker_gens = np.zeros(
+            self.num_agents, dtype=np.int16
+        )  # As of now, only really operating with gens listed from 0-1 (maybe 2)
+        # no need for high bit count
+        self.speaker_gens[:] = int(self.num_gens)
+        self.speaker_lambda = np.full(self.num_agents,fill_value=self.lambda_val, dtype=np.float64)
+        # self.speaker_lambda[:] = self.lambda_val
+        state.update({
+            'num_agents': self.num_agents,
+            'population_phi': self.population_phi,
+            'population_counts': self.population_counts,
+            'alpha_tensor': self.alpha_tensor,
+            'speaker_gens': self.speaker_gens,
+            'speaker_lambda': self.speaker_lambda,
+            'speaker_align': self.speaker_align,
+            'gen_focuses': self.gen_focuses,
+            'means':self.noise_config.means,
+            'stds':self.noise_config.stds,
+            'weight':self.noise_config.weight,
+            'avg_map': self.avg_map
+            })
+        return state
+
+    
     def _construct_w_focuses(self,state):
         """Helper function that takes a base state and returns a simulation state configured with focused alpha vectors (i.e., modified by gamma)"""
 
@@ -1364,10 +1408,13 @@ class Constructor:
         'param_dir':self.read_dir,
         }
         if self.gens_config.havefocuses:
-            if self.gens_config.import_data:
-                return self._construct_from_imports(state)
-            else:
+
+            if self.noise_config.uniformA: #Check if focuses w uniform align
                 return self._construct_w_focuses(state)
+            elif self.gens_config.import_data: #Check if focuses and import
+                return self._construct_from_imports(state)
+            else: #If focuses, without uniform alignment and no import, instantiate new agents w focuses and NuA
+                return self._construc_NuA_w_focuses(state)
         else:
             if self.noise_config.uniformA:
                 return self._construct_uniform_A(state)
@@ -1936,7 +1983,11 @@ class Ensemble:
             self.gain_values.append(gain)
             self.gain_epochs.append((i + 1) * self.time_res)
 
+            ##########################################################################
             print(f"Completed iteration {(i + 1) * self.time_res}")
+            
+            ##########################################################################
+            
             assert np.allclose(
                 self.population_phi.sum(axis=1), 1.0
             )  # Check to make sure all the phi columns sum to 1
@@ -2054,13 +2105,6 @@ if __name__ == "__main__":
         help="Determines the frequency of intergen interactions",
         default=0.50,
     )
-
-    parser.add_argument(
-        "--iterations",
-        type=float,
-        help="Determines how many millions of iterations to run the code for",
-        default=4.0,
-    )
     parser.add_argument(
         "--OutputDir",
         type=str,
@@ -2108,6 +2152,12 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
+        "--iterations",
+        type=float,
+        help="Determines how many millions of iterations to run the code for",
+        default=4.0,
+    )
+    parser.add_argument(
         "--TimeRes",
         type=float,
         help="Determines how often to collect data, in multipliers of 1 hundred thousand",
@@ -2139,7 +2189,8 @@ if __name__ == "__main__":
         "--W",
         type=float,
         help="If given inputs, sets the weight for the bimodal distribution "
-        "that alignments are drawn from in the non-uniform alignment case",
+        "that alignments are drawn from in the non-uniform alignment case.  " \
+        "The passed weight corresponds to the weighting of the higher alignment peak",
         default=0.5,
     )
     parser.add_argument(
