@@ -142,16 +142,23 @@ def run_replica(args, total_iterations,time_res, gen_config,noise_config, replic
                 time_res,
                 )
     
-    # Instantiate your simulation class here
-    # Since numba handles seeding, no explicit seed argument is needed
-    sim = Ensemble(
-        replica_base_config,
-        gen_config,
-        noise_config, # Pass the unique directory to avoid overwriting
-    )
+    
     
     # Run simulation
     if not args.Analysis:
+        #No need to instantiate ensemble if not doing new run
+        sim = Ensemble(
+            replica_base_config,
+            gen_config,
+            noise_config, # Pass the unique directory to avoid overwriting
+        )
+
+        # Instantiate your simulation class here
+        # Since numba handles seeding, no explicit seed argument is needed
+    
+
+
+
         sim.training_loop_NuA()
     Plotter = File_Interpreter(replica_dir,args.SaveFig,args.ShowFig,replica_dir ,args.fps, args.Gens, NonUniform=True)
     Plotter.plot_final_phi()
@@ -164,7 +171,7 @@ def run_replica(args, total_iterations,time_res, gen_config,noise_config, replic
     gain_vals = gain_df['gain']
     final_10_vals = np.array(gain_vals[-10:])
     print(f"Shape of final_20 is {final_10_vals.shape}")    
-    if args.Clustering:
+    if args.Cluster:
         inst_cluster = Plotter.analyse_clustering()
         return final_10_vals.mean(), inst_cluster
 
@@ -217,32 +224,50 @@ def total_scan(args,
 
     num_high_align = high_A_arr.shape[0]
 
+    
+
     if args.AllScatter:
         num_weights = w_arr.shape[0]
         all_scatter_arr = np.empty((num_weights,num_high_align)) #[weights, high align] 
         #only store mean value, if we did the violin plot it would be impossible to interpret
-
         w_iter = 0
+    
+    if args.Cluster:
+        cluster_w_iter = 0
+        num_weights = w_arr.shape[0]
+        cluster_data_arr = np.empty((num_weights,num_high_align,args.EnsembleNum)) #[weights,high_align,replica] #Violin plot  
 
     for w in w_arr:
         inst_np_arr = np.empty((num_high_align,args.EnsembleNum)) #np array to store the results of the ensmble scan
         w_dir = Path(scan_output_directory)/f"W_{w}"
 
-        if not args.Analysis: #If not args.Analysis we are collecting data, need to recapture it
-            for iter, high_align in enumerate(high_A_arr):
-                if args.Cluster: #ensemble_scan returns two values if the cluster argument is set
-                    ensemble_scan_results, clusters =ensemble_scan(args,UniformA,stds,w,low_align,high_align,gens_config,w_dir,time_res,total_iterations) 
-                else:
-                    ensemble_scan_results = ensemble_scan(args,UniformA,stds,w,low_align,high_align,gens_config,w_dir,time_res,total_iterations)
-                inst_np_arr[iter,:] = ensemble_scan_results #append to the list
+
+        #Alignment iteration
+        #----------------------------------------------------------------------------------------------------------------------------------------------#
+
+        for align_iter, high_align in enumerate(high_A_arr):
+            if args.Cluster: #ensemble_scan returns two values if the cluster argument is set
+                ensemble_scan_results, clusters =ensemble_scan(args,UniformA,stds,w,low_align,high_align,gens_config,w_dir,time_res,total_iterations) 
+                cluster_data_arr[cluster_w_iter,align_iter,:] = clusters
+                np.savetxt(Path(w_dir)/"ensemble_cluster",cluster_data_arr)
 
 
-        #Once the loop has been done we can save data and create the violin plots of the spectrum of ensemble results
-        #First save the numpy array to a txt file so it can be accessed later, no reason to use h5py for this, numpy to txt should be fine since small array
+            else:
+                ensemble_scan_results = ensemble_scan(args,UniformA,stds,w,low_align,high_align,gens_config,w_dir,time_res,total_iterations)
+            
+            
+            inst_np_arr[align_iter,:] = ensemble_scan_results #append to the list
+
+            #Once the loop has been done we can save data and create the violin plots of the spectrum of ensemble results
+            #First save the numpy array to a txt file so it can be accessed later, no reason to use h5py for this, numpy to txt should be fine since small array
         
             np.savetxt(Path(w_dir)/"ensemble_results.txt",inst_np_arr)
-        else:
-            inst_np_arr = np.loadtxt(Path(w_dir)/"ensemble_results.txt")
+
+            # inst_np_arr = np.loadtxt(Path(w_dir)/"ensemble_results.txt") #Don't know why this was here to be honest
+        #----------------------------------------------------------------------------------------------------------------------------------------------#
+        #End of alignment iteration
+        
+        
         #For the violin plot need to transpose the array
         plot_arr = inst_np_arr.T
 
@@ -264,6 +289,19 @@ def total_scan(args,
             for s in range(inst_np_arr.shape[0]):
                 all_scatter_arr[w_iter,s] = inst_np_arr[s,:].mean() #Only stores the mean, see above for reasoning
             w_iter +=1
+
+        if args.Cluster:
+            #Plot this configurations cluster violins, and increment the iterator:
+            current_cluster = cluster_data_arr[cluster_w_iter,:,:]
+            plot_current_cluster = current_cluster.T
+            fig, ax = plt.subplots(figsize = (10,6))
+            ax.violinplot(plot_current_cluster,showmeans=False,showmedians=True)
+            ax.set_xticks(range(1, num_high_align + 1))
+            ax.set_xticklabels([f"{h:.2f}" for h in high_A_arr])
+            ax.set_xlabel("High Alignment")
+            ax.set_ylabel("Replica Cluster")
+            ax.set_title(f"Violin Plot W = {w}")
+            plt.savefig(Path(w_dir)/"cluster_violin.png")
 
     if args.AllScatter:
         #Need to actually make the scatterplot now
