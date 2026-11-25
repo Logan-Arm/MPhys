@@ -1140,6 +1140,23 @@ class Constructor:
         A = A + A.T
         return A
 
+    def generate_frequency_from_NuA(self,alignment_matrix:np.ndarray, N:int,):
+        """Takes a provided alignment matrix, and from this generates a frequency matrix, wherein each row corresponds to a speaker (i)
+        and the columns within the row correspond to the likelihood the receiver of that interaction being receiver j.
+        
+        Procedure for doing so is simple, normalize each row.  This will be passed into a numba training procedure, wherein alignment
+        values are constant, but the again frequency of interactions vary
+        """
+        #Alignment matrix will be of size N x N
+        frequency_arr = np.empty((N,N))
+        for i in range(N):
+            #Grabbing rows
+            frequency_arr[i,:] = alignment_matrix[i,:]/np.linalg.norm(alignment_matrix[i,:]) #append normalised rows
+        assert np.allclose(
+                frequency_arr.sum(axis=1), 1.0
+            )
+        
+
     def read_param_file(self, params_dir):
         """
         dir: params_directory
@@ -1800,9 +1817,16 @@ class Ensemble:
             self.gain_epochs.append((i + 1) * self.time_res)
 
             print(f"Completed iteration {(i + 1) * self.time_res}")
+
+##################################################################################################################
+##################################################################################################################
+
             assert np.allclose(
-                self.population_phi.sum(axis=1), 1.0
+                self.population_phi.sum(axis=0), 1.0 #<------ THIS WAS AXIS = 1 BEFORE
             )  # Check to make sure all the phi columns sum to 1
+
+##################################################################################################################
+##################################################################################################################
 
             #Write to file
             self.file_saver.write_to_h5(i,self.population_phi,self.population_counts,self.num_gens,gain_values=self.gain_values, gain_epochs=self.gain_epochs)
